@@ -1,0 +1,13 @@
+{
+  "id": "6f1c2a5e-3b8d-4c1e-9a7f-2d4b6e8f0a1c",
+  "clientId": "0b9e7d5c-3a1f-4e2d-8c6b-5a4f3e2d1c0b",
+  "paneId": "w1B:p1",
+  "askedAt": 1792540800000,
+  "body": {
+    "kind": "ask",
+    "title": "Merge PR #123?",
+    "question": "CI is green. Should I merge #123 now?",
+    "options": ["Yes, merge", "No", "Wait for review"],
+    "links": ["https://github.com/mosmos21/hailr/pull/1"]
+  }
+}

@@ -1,0 +1,13 @@
+{
+  "id": "6f1c2a5e-3b8d-4c1e-9a7f-2d4b6e8f0a1d",
+  "clientId": "0b9e7d5c-3a1f-4e2d-8c6b-5a4f3e2d1c0b",
+  "paneId": "w1B:p1",
+  "askedAt": 1792540800001,
+  "body": {
+    "kind": "ask",
+    "title": "Pick a DB index name",
+    "question": "Which name should the new index use?",
+    "options": [],
+    "links": []
+  }
+}
