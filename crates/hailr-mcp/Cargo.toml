@@ -1,9 +1,0 @@
-[package]
-name = "hailr-mcp"
-version.workspace = true
-edition.workspace = true
-repository.workspace = true
-
-[dependencies]
-hailr-core.workspace = true
-hailr-herdr.workspace = true

@@ -14,14 +14,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "hailr-mcp"
-version = "0.1.0"
-dependencies = [
- "hailr-core",
- "hailr-herdr",
-]
-
-[[package]]
 name = "hailr-tui"
 version = "0.1.0"
 dependencies = [
