@@ -1,0 +1,9 @@
+[package]
+name = "hailr-tui"
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+
+[dependencies]
+hailr-core.workspace = true
+hailr-herdr.workspace = true
