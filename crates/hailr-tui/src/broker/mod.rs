@@ -7,6 +7,9 @@ use hailr_core::protocol::{
 };
 use tokio::sync::{mpsc, watch};
 
+pub mod http;
+pub mod socket;
+
 const CLIENT_QUEUE: usize = 16;
 
 /// 全 pane の未回答の質問の写しと、接続中の ask-mcp を持つ。質問の正は ask-mcp 側にある
