@@ -17,6 +17,11 @@ pub struct App {
     moved: bool,
     /// 直前の描画で見えていたボタンの数。見えていない番号では答えさせない
     shown_buttons: Cell<usize>,
+    /// `o` を押し、開くリンクの番号を待っている。数字と `o` 以外のキーで消す
+    opening: bool,
+    /// 待ちの中で直前に開いたリンク。押しっぱなしで同じリンクを何度も開かない
+    opened: Option<usize>,
+    shown_links: Cell<usize>,
 }
 
 impl App {
@@ -28,6 +33,7 @@ impl App {
             let last = self.questions.len().checked_sub(1);
             if self.selected.is_some() {
                 self.moved = true;
+                self.end_opening();
             }
             self.selected = last.map(|last| self.questions[position.min(last)].id);
         }
@@ -100,6 +106,33 @@ impl App {
 
     pub fn shown_buttons(&self) -> usize {
         self.shown_buttons.get()
+    }
+
+    pub fn set_shown_links(&self, count: usize) {
+        self.shown_links.set(count);
+    }
+
+    pub fn shown_links(&self) -> usize {
+        self.shown_links.get()
+    }
+
+    pub fn start_opening(&mut self) {
+        self.opening = true;
+        self.opened = None;
+    }
+
+    pub fn opening(&self) -> bool {
+        self.opening
+    }
+
+    pub fn end_opening(&mut self) {
+        self.opening = false;
+        self.opened = None;
+    }
+
+    /// 同じ待ちの中で直前に開いたリンクなら false
+    pub fn mark_opened(&mut self, link: usize) -> bool {
+        self.opened.replace(link) != Some(link)
     }
 
     fn move_selection(&mut self, step: impl Fn(usize) -> usize) {

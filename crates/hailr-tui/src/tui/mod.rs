@@ -78,8 +78,13 @@ async fn run_loop(
                 Some(Err(e)) => return Err(e),
                 Some(Ok(event)) => match input::action(&event) {
                     Some(Action::Quit) => return Ok(()),
-                    Some(action) => {
-                        if let Some((id, pane)) = apply(&mut app, broker, action) {
+                    Some(action) => match apply(&mut app, broker, action) {
+                        Some(Effect::Open(link)) => {
+                            if let Err(e) = checked_url(&link).and_then(|url| open_link(&url)) {
+                                app.set_notice(format!("not opened: {e}"));
+                            }
+                        }
+                        Some(Effect::Attach(id, pane)) => {
                             // crossterm の読み手が子に渡した端末の入力を横取りするため、渡す前に落とす
                             drop(events);
                             let attached = attach(terminal, &*mux, broker, &id, &pane, stop.as_mut(), panicked);
@@ -90,8 +95,12 @@ async fn run_loop(
                             events = EventStream::new();
                             back_from_attach(&mut app, broker, &id, handover);
                         }
+                        None => {}
+                    },
+                    None if input::is_press(&event) => {
+                        app.clear_notice();
+                        app.end_opening();
                     }
-                    None if input::is_press(&event) => app.clear_notice(),
                     None => {}
                 },
             },
@@ -110,10 +119,32 @@ async fn run_loop(
     }
 }
 
-/// 押した時点の選択に対して行う。知らせは次のキーで消す。attach する質問と pane を返す
-fn apply(app: &mut App, broker: &Broker, action: Action) -> Option<(QuestionId, PaneId)> {
+/// TUI の外で行うこと
+#[derive(Debug, PartialEq, Eq)]
+enum Effect {
+    Attach(QuestionId, PaneId),
+    Open(String),
+}
+
+/// 押した時点の選択に対して行う。知らせは次のキーで消す
+fn apply(app: &mut App, broker: &Broker, action: Action) -> Option<Effect> {
     app.clear_notice();
-    let acts = matches!(action, Action::Answer(_) | Action::Delete | Action::Attach);
+    // `o` の後の数字を回答と取り違えないよう、待ちの間は数字をリンクの番号にだけ使い、数字と `o` 以外のキーで待ちを終える
+    if app.opening() {
+        match action {
+            Action::Answer(link) if link < app.shown_links() => {
+                let url = app.selected()?.body.links().get(link)?.clone();
+                return app.mark_opened(link).then_some(Effect::Open(url));
+            }
+            Action::Answer(_) | Action::Open => {}
+            _ => app.end_opening(),
+        }
+        return None;
+    }
+    let acts = matches!(
+        action,
+        Action::Answer(_) | Action::Delete | Action::Attach | Action::Open
+    );
     if acts && app.selected().is_none() {
         return None;
     }
@@ -144,7 +175,16 @@ fn apply(app: &mut App, broker: &Broker, action: Action) -> Option<(QuestionId, 
                 app.set_questions(broker.snapshot());
             }
         }
-        Action::Attach => return app.selected().map(|q| (q.id, q.pane_id.clone())),
+        Action::Attach => {
+            return app
+                .selected()
+                .map(|q| Effect::Attach(q.id, q.pane_id.clone()));
+        }
+        Action::Open => {
+            if app.shown_links() > 0 {
+                app.start_opening();
+            }
+        }
         Action::Quit => {}
     }
     None
@@ -308,6 +348,39 @@ fn back_from_attach(app: &mut App, broker: &Broker, id: &QuestionId, handover: H
     }
 }
 
+/// http / https 以外の scheme は OS の関連付けでアプリを起こし、userinfo は表示のホストを偽らせるため断る
+fn checked_url(link: &str) -> io::Result<url::Url> {
+    let invalid = |reason: &str| io::Error::new(io::ErrorKind::InvalidInput, reason.to_owned());
+    let url = url::Url::parse(link).map_err(|e| invalid(&e.to_string()))?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err(invalid("only http and https links open"));
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(invalid("links with a user name do not open"));
+    }
+    Ok(url)
+}
+
+/// tokio の runtime の中で呼ぶ
+fn open_link(url: &url::Url) -> io::Result<()> {
+    let opener = if cfg!(target_os = "macos") {
+        "open"
+    } else {
+        "xdg-open"
+    };
+    // 待たずに手放す。終わった子は tokio が回収する
+    let spawned = tokio::process::Command::new(opener)
+        .arg(url.as_str())
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+    if let Err(e) = &spawned {
+        tracing::warn!("cannot start {opener}: {e}");
+    }
+    spawned.map(drop)
+}
+
 struct AbortOnDrop(tokio::task::JoinHandle<()>);
 
 impl Drop for AbortOnDrop {
@@ -460,7 +533,7 @@ mod tests {
         next.asked_at = 2;
         next.pane_id = PaneId("w1:p2".into());
         let mut app = second_selected(&broker, &[first.clone(), next.clone()]);
-        let target = Some((next.id, next.pane_id.clone()));
+        let target = Some(Effect::Attach(next.id, next.pane_id.clone()));
         assert_eq!(apply(&mut app, &broker, Action::Attach), target);
 
         apply(&mut app, &broker, Action::Previous);
@@ -609,5 +682,151 @@ mod tests {
             .status()
             .unwrap()
             .success()
+    }
+
+    fn with_links(client: ClientId, links: &[&str]) -> Question {
+        let mut question = ask(client, &["Yes"]);
+        if let QuestionBody::Ask { links: l, .. } = &mut question.body {
+            *l = links.iter().map(|l| l.to_string()).collect();
+        }
+        question
+    }
+
+    #[test]
+    fn opens_the_link_after_o_and_never_answers_with_that_digit() {
+        let broker = Broker::new();
+        let client = ClientId(Uuid::new_v4());
+        let (mut events, _guard) = broker.connect(client);
+        let mut question = with_links(client, &["https://a.example/", "https://b.example/"]);
+        if let QuestionBody::Ask { options, .. } = &mut question.body {
+            options.push("No".into());
+        }
+        broker.register(question).unwrap();
+        let mut app = App::default();
+        app.set_questions(broker.snapshot());
+        app.set_shown_buttons(2);
+        app.set_shown_links(2);
+
+        let open = |url: &str| Some(Effect::Open(url.into()));
+        apply(&mut app, &broker, Action::Open);
+        assert_eq!(
+            apply(&mut app, &broker, Action::Answer(1)),
+            open("https://b.example/")
+        );
+        assert_eq!(
+            apply(&mut app, &broker, Action::Answer(1)),
+            None,
+            "held down"
+        );
+        assert_eq!(
+            apply(&mut app, &broker, Action::Open),
+            None,
+            "o keeps waiting"
+        );
+        assert_eq!(
+            apply(&mut app, &broker, Action::Answer(1)),
+            None,
+            "o 2 o 2 opens once"
+        );
+        assert_eq!(
+            apply(&mut app, &broker, Action::Answer(0)),
+            open("https://a.example/")
+        );
+        assert_eq!(
+            apply(&mut app, &broker, Action::Answer(1)),
+            open("https://b.example/")
+        );
+        app.set_shown_links(1);
+        assert_eq!(
+            apply(&mut app, &broker, Action::Answer(1)),
+            None,
+            "hidden link"
+        );
+        app.set_shown_links(0);
+        assert_eq!(
+            apply(&mut app, &broker, Action::Answer(0)),
+            None,
+            "nothing on screen"
+        );
+        assert!(app.opening(), "digits keep waiting");
+        assert!(events.try_recv().is_err(), "no digit answered");
+
+        let selected = app.selected_index();
+        apply(&mut app, &broker, Action::Next);
+        assert!(!app.opening(), "another key ends the wait");
+        assert_eq!(app.selected_index(), selected, "and does nothing else");
+        app.set_shown_links(2);
+        apply(&mut app, &broker, Action::Open);
+        assert_eq!(
+            apply(&mut app, &broker, Action::Attach),
+            None,
+            "Enter only cancels"
+        );
+        apply(&mut app, &broker, Action::Open);
+        assert_eq!(apply(&mut app, &broker, Action::Delete), None);
+        assert_eq!(broker.snapshot().len(), 1, "d only cancels");
+        assert!(!app.opening());
+
+        app.set_shown_links(0);
+        apply(&mut app, &broker, Action::Open);
+        assert!(!app.opening(), "nothing to open");
+    }
+
+    #[test]
+    fn waits_for_a_choice_before_opening_after_the_selection_moved() {
+        let broker = Broker::new();
+        let client = ClientId(Uuid::new_v4());
+        let (_events, _guard) = broker.connect(client);
+        let mut app = App::default();
+        app.set_shown_links(1);
+        apply(&mut app, &broker, Action::Open);
+        assert!(!app.opening(), "no questions");
+
+        let first = with_links(client, &["https://a.example/"]);
+        let mut next = with_links(client, &["https://b.example/"]);
+        next.asked_at = 2;
+        let mut app = second_selected(&broker, &[first.clone(), next]);
+        app.set_shown_links(1);
+        apply(&mut app, &broker, Action::Open);
+        assert!(app.opening());
+        let mut another = with_links(client, &[]);
+        another.asked_at = 0;
+        broker.register(another).unwrap();
+        assert_eq!(app.selected_index(), Some(1));
+        app.set_questions(broker.snapshot());
+        assert_eq!(
+            app.selected_index(),
+            Some(2),
+            "an older question came first"
+        );
+        assert!(app.opening(), "a new question does not end the wait");
+        let opened = apply(&mut app, &broker, Action::Answer(0));
+        assert_eq!(opened, Some(Effect::Open("https://b.example/".into())));
+        // 開く待ちのまま、選んでいた質問が取り下げられた
+        broker.withdraw(&app.selected().unwrap().id, WithdrawReason::Deleted);
+        app.set_questions(broker.snapshot());
+        assert!(!app.opening(), "the wait ends with the question");
+        apply(&mut app, &broker, Action::Open);
+        assert!(!app.opening(), "moved");
+        assert!(app.notice().unwrap().contains("pick a question first"));
+    }
+
+    #[test]
+    fn opens_only_plain_web_links() {
+        for link in ["https://a.example/x", "HTTP://A.example"] {
+            assert!(checked_url(link).is_ok(), "{link}");
+        }
+        for link in [
+            "file:///etc/passwd",
+            "vscode://x",
+            "ftp://x",
+            "-a",
+            "not a url",
+            "https://github.com@evil.example/",
+            "https://u:p@example.com/",
+            "https://:p@example.com/",
+        ] {
+            assert!(checked_url(link).is_err(), "{link}");
+        }
     }
 }

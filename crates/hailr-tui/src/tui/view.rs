@@ -53,12 +53,24 @@ fn keys(app: &App) -> String {
     if app.moved_on_its_own() {
         return " ↑↓ select  q quit".into();
     }
+    if app.opening() {
+        return match app.shown_links() {
+            0 => " no links on screen  any other key cancels".into(),
+            1 => " 1 open link  any other key cancels".into(),
+            n => format!(" 1-{n} open link  any other key cancels"),
+        };
+    }
     let answer = match app.shown_buttons() {
         0 => String::new(),
         1 => "  1 answer".into(),
         n => format!("  1-{n} answer"),
     };
-    format!(" ↑↓ select{answer}  Enter attach  d delete  q quit")
+    let open = if app.shown_links() > 0 {
+        "  o open"
+    } else {
+        ""
+    };
+    format!(" ↑↓ select{answer}{open}  Enter attach  d delete  q quit")
 }
 
 fn draw_list(frame: &mut Frame, app: &App, area: Rect) {
@@ -85,7 +97,8 @@ fn draw_question(frame: &mut Frame, app: &App, question: &Question, area: Rect) 
     let wrapped = paragraph.line_count(area.width.saturating_sub(2));
     let wrapped = u16::try_from(wrapped).unwrap_or(u16::MAX);
     let height = wrapped.saturating_add(2).min(area.height / 3).max(3);
-    let rows = button_rows(&question.body, area.width.saturating_sub(2));
+    let mut rows = button_rows(&question.body, area.width.saturating_sub(2));
+    rows.extend(link_rows(&question.body, area.width.saturating_sub(2)));
     let rows_height = match rows.len() {
         0 => 0,
         n => u16::try_from(n)
@@ -101,6 +114,7 @@ fn draw_question(frame: &mut Frame, app: &App, question: &Question, area: Rect) 
     ])
     .areas(area);
     app.set_shown_buttons(0);
+    app.set_shown_links(0);
     if !rows.is_empty() {
         let mut block = Block::bordered().border_style(MUTED);
         let inner = block.inner(choices);
@@ -110,23 +124,32 @@ fn draw_question(frame: &mut Frame, app: &App, question: &Question, area: Rect) 
         } else {
             usize::from(inner.height)
         };
-        let mut rows = rows;
         if rows.len() > visible && visible == 1 {
             block = block.title(Line::styled("more hidden", WARNING));
         }
-        // 隠れたボタンの番号では答えさせないため、見えている数を App に渡し、隠れていることも出す
+        // 隠れたボタンやリンクの番号では答えさせない・開かせないため、見えている数を App に渡し、隠れていることも出す
         if rows.len() > visible {
             let keep = if visible >= 2 { visible - 1 } else { visible };
-            rows.truncate(keep);
+            let hidden = rows.split_off(keep);
             if visible >= 2 {
-                rows.push((
-                    Line::styled("some buttons are hidden; make the window taller", WARNING),
-                    0,
-                ));
+                let what = if hidden.iter().any(|row| row.buttons > 0) {
+                    "buttons"
+                } else {
+                    "links"
+                };
+                rows.push(Row {
+                    line: Line::styled(
+                        format!("some {what} are hidden; make the window taller"),
+                        WARNING,
+                    ),
+                    buttons: 0,
+                    links: 0,
+                });
             }
         }
-        app.set_shown_buttons(rows.iter().map(|(_, count)| count).sum());
-        let lines: Vec<Line> = rows.into_iter().map(|(line, _)| line).collect();
+        app.set_shown_buttons(rows.iter().map(|row| row.buttons).sum());
+        app.set_shown_links(rows.iter().map(|row| row.links).sum());
+        let lines: Vec<Line> = rows.into_iter().map(|row| row.line).collect();
         frame.render_widget(Paragraph::new(lines).block(block), choices);
     }
 
@@ -155,22 +178,149 @@ fn draw_question(frame: &mut Frame, app: &App, question: &Question, area: Rect) 
     frame.render_widget(paragraph.block(block), asked);
 }
 
+/// ボタンの枠の 1 行と、その行にあるボタンとリンクの数
+struct Row {
+    line: Line<'static>,
+    buttons: usize,
+    links: usize,
+}
+
 /// 選択肢を `[ 1 Yes ]` の形で並べ、幅に入るだけ 1 行に詰める。ボタンの途中では折り返さない
-/// 行ごとにボタンの数も返す
-fn button_rows(body: &QuestionBody, width: u16) -> Vec<(Line<'static>, usize)> {
-    let mut rows: Vec<(Line, usize)> = Vec::new();
+fn button_rows(body: &QuestionBody, width: u16) -> Vec<Row> {
+    let mut rows: Vec<Row> = Vec::new();
     for (i, option) in body.options().iter().enumerate() {
         let button = Span::styled(format!("[ {} {} ]", i + 1, printable(option)), ACCENT);
         match rows.last_mut() {
-            Some((row, count)) if row.width() + 1 + button.width() <= usize::from(width) => {
-                row.push_span(" ");
-                row.push_span(button);
-                *count += 1;
+            Some(row) if row.line.width() + 1 + button.width() <= usize::from(width) => {
+                row.line.push_span(" ");
+                row.line.push_span(button);
+                row.buttons += 1;
             }
-            _ => rows.push((Line::from(button), 1)),
+            _ => rows.push(Row {
+                line: Line::from(button),
+                buttons: 1,
+                links: 0,
+            }),
         }
     }
     rows
+}
+
+/// リンクは 1 行に 1 つ。ホストを出せないリンクとそれより後ろは開かせず、番号を控えめの色にする
+fn link_rows(body: &QuestionBody, width: u16) -> Vec<Row> {
+    let mut openable = true;
+    body.links()
+        .iter()
+        .enumerate()
+        .map(|(i, link)| {
+            let number = format!("o{} ", i + 1);
+            let room = usize::from(width).saturating_sub(number.len());
+            let shown = fit(&short_link(link), room);
+            openable &= shown.is_some();
+            Row {
+                line: Line::from(vec![
+                    Span::styled(number, if openable { ACCENT } else { MUTED }),
+                    Span::raw(shown.unwrap_or_else(|| "…".into())),
+                ]),
+                buttons: 0,
+                links: usize::from(openable),
+            }
+        })
+        .collect()
+}
+
+/// 縮めるときに残す scheme とホストと、縮めてよい残り
+#[derive(Debug, PartialEq, Eq)]
+struct Label {
+    scheme: &'static str,
+    host: String,
+    port: String,
+    rest: String,
+    /// ドメイン名のホストだけは `.` の境目で左を落としてよい
+    domain: bool,
+}
+
+/// 右端で切れて別のホストに見えないよう、ホストを残してパスを縮める。ホストも入らなければ `.` の境目で左を落とし、
+/// それも入らなければ None
+fn fit(label: &Label, room: usize) -> Option<String> {
+    let Label {
+        scheme,
+        host,
+        port,
+        rest,
+        domain,
+    } = label;
+    let head = format!("{scheme}{host}{port}");
+    let (head_len, rest_len) = (head.chars().count(), rest.chars().count());
+    if head_len + rest_len <= room {
+        return Some(head + rest);
+    }
+    if head_len < room {
+        let kept: String = rest.chars().take(room - head_len - 1).collect();
+        return Some(format!("{head}{kept}…"));
+    }
+    if !domain {
+        return None;
+    }
+    let left = room.checked_sub(scheme.len() + 1 + port.len())?;
+    let host = host.trim_end_matches('.');
+    let cut = host
+        .char_indices()
+        .filter(|&(_, c)| c == '.')
+        .map(|(i, _)| &host[i..])
+        .find(|suffix| suffix.chars().count() <= left)?;
+    Some(format!("{scheme}…{cut}{port}"))
+}
+
+/// GitHub の PR / issue は `owner/repo#番号`、ほかはホストとパスで出す
+fn short_link(link: &str) -> Label {
+    let other = |text: &str| Label {
+        scheme: "",
+        host: String::new(),
+        port: String::new(),
+        rest: printable(text),
+        domain: false,
+    };
+    let Ok(url) = url::Url::parse(link) else {
+        return other(link);
+    };
+    let Some(host) = url.host_str() else {
+        return other(link);
+    };
+    let path = url.path().trim_end_matches('/');
+    let segments: Vec<&str> = path.split('/').skip(1).collect();
+    let plain = url.port().is_none() && url.query().is_none() && url.fragment().is_none();
+    if url.scheme() == "https"
+        && host == "github.com"
+        && plain
+        && let [owner, repo, "pull" | "issues", number] = segments.as_slice()
+        && !number.is_empty()
+        && number.bytes().all(|b| b.is_ascii_digit())
+    {
+        // どの repo かが読めないまま開かせないよう、owner/repo は縮めない
+        return Label {
+            scheme: "",
+            host: printable(&format!("{owner}/{repo}")),
+            port: String::new(),
+            rest: printable(&format!("#{number}")),
+            domain: false,
+        };
+    }
+    // userinfo（`github.com@evil.example`）でホストを偽らせないよう出さない
+    let port = url.port().map(|p| format!(":{p}")).unwrap_or_default();
+    let query = url.query().map(|q| format!("?{q}")).unwrap_or_default();
+    let fragment = url.fragment().map(|f| format!("#{f}")).unwrap_or_default();
+    Label {
+        scheme: if url.scheme() == "https" {
+            ""
+        } else {
+            "http://"
+        },
+        host: printable(host),
+        port,
+        rest: printable(&format!("{path}{query}{fragment}")),
+        domain: matches!(url.host(), Some(url::Host::Domain(_))),
+    }
 }
 
 fn body_text(body: &QuestionBody) -> String {
@@ -493,5 +643,229 @@ mod tests {
             render(&app, Side::Right, width, 30);
             assert_eq!(app.shown_buttons(), 0, "width {width}");
         }
+    }
+
+    fn with_links(options: &[&str], links: &[&str]) -> Question {
+        let mut question = ask("w1:p1", "Merge PR?", "Ship it?");
+        question.body = QuestionBody::Ask {
+            title: "Merge PR?".into(),
+            question: "Ship it?".into(),
+            options: options.iter().map(|o| o.to_string()).collect(),
+            links: links.iter().map(|l| l.to_string()).collect(),
+        };
+        question
+    }
+
+    #[test]
+    fn shortens_links() {
+        for (link, short) in [
+            (
+                "https://github.com/mosmos21/hailr/pull/1",
+                "mosmos21/hailr#1",
+            ),
+            (
+                "https://github.com/mosmos21/hailr/issues/7/",
+                "mosmos21/hailr#7",
+            ),
+            (
+                "https://github.com/mosmos21/hailr/pull/1/files",
+                "github.com/mosmos21/hailr/pull/1/files",
+            ),
+            (
+                "https://github.com/mosmos21/hailr/pull/1#x",
+                "github.com/mosmos21/hailr/pull/1#x",
+            ),
+            (
+                "https://github.com/mosmos21/hailr/pull/new",
+                "github.com/mosmos21/hailr/pull/new",
+            ),
+            (
+                "http://github.com/mosmos21/hailr/pull/1",
+                "http://github.com/mosmos21/hailr/pull/1",
+            ),
+            (
+                "https://github.com/mosmos21/hailr",
+                "github.com/mosmos21/hailr",
+            ),
+            ("https://github.com@evil.example/x", "evil.example/x"),
+            ("https://u:p@example.com:8443/a", "example.com:8443/a"),
+            (
+                "https://example.com/docs/release/",
+                "example.com/docs/release",
+            ),
+            ("http://example.com/a?b=c", "http://example.com/a?b=c"),
+            ("https://app.example/#/admin", "app.example#/admin"),
+            ("mailto:a", "mailto:a"),
+            ("not a url\u{1b}", "not a url "),
+        ] {
+            assert_eq!(
+                fit(&short_link(link), 100).as_deref(),
+                Some(short),
+                "{link}"
+            );
+        }
+    }
+
+    #[test]
+    fn lists_links_under_the_buttons() {
+        let mut app = App::default();
+        let links = [
+            "https://github.com/mosmos21/hailr/pull/1",
+            "https://example.com/docs",
+        ];
+        app.set_questions(vec![with_links(&["Yes", "No"], &links)]);
+        let rows = render(&app, Side::Right, 100, 30);
+        let text = rows.join("\n");
+        let buttons = rows
+            .iter()
+            .position(|r| r.contains("[ 1 Yes ] [ 2 No ]"))
+            .unwrap();
+        assert!(rows[buttons + 1].contains("o1 mosmos21/hailr#1"), "{text}");
+        assert!(rows[buttons + 2].contains("o2 example.com/docs"), "{text}");
+        assert_eq!(app.shown_links(), 2);
+        assert_eq!(
+            rows[29].trim_end(),
+            " ↑↓ select  1-2 answer  o open  Enter attach  d delete  q quit"
+        );
+
+        app.start_opening();
+        let rows = render(&app, Side::Right, 100, 30);
+        assert_eq!(rows[29].trim_end(), " 1-2 open link  any other key cancels");
+    }
+
+    #[test]
+    fn counts_only_the_links_on_screen() {
+        let mut app = App::default();
+        let links = [
+            "https://a.example",
+            "https://b.example",
+            "https://c.example",
+        ];
+        app.set_questions(vec![with_links(&["Yes"], &links)]);
+        // ボタンの枠は 1/3 の 4 行（中身 2 行）。ボタン 1 行と知らせ 1 行になる
+        let rows = render(&app, Side::Right, 100, 13);
+        let text = rows.join("\n");
+        assert!(text.contains("some links are hidden"), "{text}");
+        assert!(!text.contains("o1 "), "{text}");
+        assert_eq!(app.shown_links(), 0);
+        assert_eq!(app.shown_buttons(), 1);
+        app.start_opening();
+        let rows = render(&app, Side::Right, 100, 13);
+        assert_eq!(
+            rows[12].trim_end(),
+            " no links on screen  any other key cancels"
+        );
+
+        let rows = render(&app, Side::Right, 100, 16);
+        let text = rows.join("\n");
+        assert!(text.contains("o1 a.example"), "{text}");
+        assert!(!text.contains("o2 "), "{text}");
+        assert_eq!(app.shown_links(), 1);
+    }
+
+    #[test]
+    fn keeps_the_host_when_a_link_does_not_fit() {
+        let label = |link: &str| short_link(link);
+        assert_eq!(
+            label("http://a.example:8080/x?y#z"),
+            Label {
+                scheme: "http://",
+                host: "a.example".into(),
+                port: ":8080".into(),
+                rest: "/x?y#z".into(),
+                domain: true,
+            }
+        );
+        let shown = |link: &str, room| fit(&label(link), room);
+        assert_eq!(
+            shown("https://a.example/docs", 14).as_deref(),
+            Some("a.example/docs")
+        );
+        assert_eq!(
+            shown("https://a.example/docs/release", 14).as_deref(),
+            Some("a.example/doc…")
+        );
+        assert_eq!(
+            shown("https://a.example/x", 10).as_deref(),
+            Some("a.example…")
+        );
+        assert_eq!(
+            shown("https://a.example/x", 9).as_deref(),
+            Some("….example")
+        );
+        assert_eq!(
+            shown("https://evilgithub.com/x", 11).as_deref(),
+            Some("….com")
+        );
+        assert_eq!(
+            shown("https://github.com.aaaa.evil.example/", 14).as_deref(),
+            Some("….evil.example")
+        );
+        assert_eq!(
+            shown("http://login.very-long.bank.example/", 20).as_deref(),
+            Some("http://….example")
+        );
+        assert_eq!(shown("https://a.example/", 7), None);
+        assert_eq!(shown("https://[::1]/x", 3), None);
+        assert_eq!(shown("https://10.0.0.1/x", 5), None);
+        assert_eq!(
+            shown("https://evil.example./x", 10).as_deref(),
+            Some("….example")
+        );
+        assert_eq!(
+            shown("https://evil.example./x", 9).as_deref(),
+            Some("….example")
+        );
+        assert_eq!(shown("https://evil.example./x", 8), None);
+        assert_eq!(shown("https://evil.example.:8080/x", 10), None);
+        assert_eq!(
+            shown("https://a.example:8080/x", 14).as_deref(),
+            Some("….example:8080")
+        );
+        assert_eq!(shown("https://a.example/x", 8), None);
+        assert_eq!(shown("https://a.example/x", 0), None);
+        let io = "https://github.com/mosmos21/user.github.io/pull/1";
+        assert_eq!(shown(io, 23), None, "owner/repo is never cut");
+        let pull = "https://github.com/mosmos21/hailr/pull/12";
+        assert_eq!(shown(pull, 17).as_deref(), Some("mosmos21/hailr#12"));
+        assert_eq!(shown(pull, 16).as_deref(), Some("mosmos21/hailr#…"));
+        assert_eq!(shown(pull, 15).as_deref(), Some("mosmos21/hailr…"));
+        assert_eq!(shown(pull, 14), None);
+    }
+
+    #[test]
+    fn stops_counting_links_at_one_whose_host_cannot_be_shown() {
+        let counts = |links: &[&str]| {
+            let question = with_links(&[], links);
+            let rows = link_rows(&question.body, 12);
+            rows.iter().map(|row| row.links).collect::<Vec<_>>()
+        };
+        let long = "https://a-very-long-host-name/x";
+        assert_eq!(counts(&["https://a.b/", long]), [1, 0]);
+        assert_eq!(counts(&[long, "https://a.b/"]), [0, 0]);
+        assert_eq!(
+            counts(&["https://255.255.255.255/", "https://a.b/"]),
+            [0, 0]
+        );
+        assert_eq!(
+            counts(&["https://github.com/mosmos21/hailr/pull/1", "https://a.b/"]),
+            [0, 0]
+        );
+
+        let question = with_links(&[], &["https://a.b/", long]);
+        let rows = link_rows(&question.body, 12);
+        let numbers: Vec<_> = rows.iter().map(|row| row.line.spans[0].style.fg).collect();
+        assert_eq!(numbers, [Some(ACCENT), Some(MUTED)]);
+        assert_eq!(rows[1].line.to_string(), "o2 …");
+
+        let question = with_links(&[], &[long, "https://a.b/"]);
+        let rows = link_rows(&question.body, 12);
+        let numbers: Vec<_> = rows.iter().map(|row| row.line.spans[0].style.fg).collect();
+        assert_eq!(
+            numbers,
+            [Some(MUTED), Some(MUTED)],
+            "after one that cannot open"
+        );
+        assert_eq!(rows[1].line.to_string(), "o2 a.b");
     }
 }
