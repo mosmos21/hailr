@@ -8,6 +8,7 @@ pub enum Action {
     Answer(usize),
     Delete,
     Attach,
+    Open,
     Quit,
 }
 
@@ -30,6 +31,7 @@ pub fn action(event: &Event) -> Option<Action> {
         KeyCode::Char(c @ '1'..='9') if plain => Some(Action::Answer(*c as usize - '1' as usize)),
         KeyCode::Char('d') if plain => Some(Action::Delete),
         KeyCode::Enter if plain => Some(Action::Attach),
+        KeyCode::Char('o') if plain => Some(Action::Open),
         KeyCode::Char('q') => Some(Action::Quit),
         KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => Some(Action::Quit),
         _ => None,
@@ -79,6 +81,9 @@ mod tests {
         assert_eq!(press(KeyCode::Enter, none), Some(Action::Attach));
         assert_eq!(press(KeyCode::Enter, KeyModifiers::ALT), None);
         assert_eq!(press(KeyCode::Enter, KeyModifiers::CONTROL), None);
+        assert_eq!(press(KeyCode::Char('o'), none), Some(Action::Open));
+        assert_eq!(press(KeyCode::Char('o'), KeyModifiers::CONTROL), None);
+        assert_eq!(press(KeyCode::Char('o'), KeyModifiers::ALT), None);
         assert_eq!(press(KeyCode::Char('q'), none), Some(Action::Quit));
         assert_eq!(
             press(KeyCode::Char('c'), KeyModifiers::CONTROL),
