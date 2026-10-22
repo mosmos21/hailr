@@ -48,10 +48,11 @@ impl Mux for HerdrMux {
         Ok(String::from_utf8_lossy(&out).into_owned())
     }
 
-    fn attach_command(&self, pane: &PaneId) -> Command {
+    fn attach_command(&self, pane: &PaneId) -> Result<Command, MuxError> {
+        let pane = checked(pane)?;
         let mut command = Command::new(&self.bin);
-        command.args(["agent", "attach", &pane.0]);
-        command
+        command.args(["agent", "attach", pane]);
+        Ok(command)
     }
 
     fn notify(&self, title: &str, body: &str) -> Result<(), MuxError> {
@@ -177,11 +178,16 @@ mod tests {
 
     #[test]
     fn attach_command_attaches_to_the_pane() {
-        let command = HerdrMux::with_bin("herdr").attach_command(&pane("w1B:p1"));
+        let mux = HerdrMux::with_bin("herdr");
+        let command = mux.attach_command(&pane("w1B:p1")).unwrap();
         assert_eq!(command.get_program(), Path::new("herdr"));
         assert_eq!(
             command.get_args().collect::<Vec<_>>(),
             ["agent", "attach", "w1B:p1"]
         );
+        for id in ["", "-x", "--takeover"] {
+            let refused = mux.attach_command(&pane(id));
+            assert!(matches!(refused, Err(MuxError::InvalidPane)), "{id:?}");
+        }
     }
 }

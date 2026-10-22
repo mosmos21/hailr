@@ -58,7 +58,7 @@ fn keys(app: &App) -> String {
         1 => "  1 answer".into(),
         n => format!("  1-{n} answer"),
     };
-    format!(" ↑↓ select{answer}  d delete  q quit")
+    format!(" ↑↓ select{answer}  Enter attach  d delete  q quit")
 }
 
 fn draw_list(frame: &mut Frame, app: &App, area: Rect) {
@@ -380,7 +380,7 @@ mod tests {
         assert!(buttons > asked, "{}", rows.join("\n"));
         assert_eq!(
             rows[15].trim_end(),
-            " ↑↓ select  1-2 answer  d delete  q quit"
+            " ↑↓ select  1-2 answer  Enter attach  d delete  q quit"
         );
 
         app.set_questions(vec![with_options(&["Yes"])]);
@@ -396,7 +396,7 @@ mod tests {
         let rows = render(&app, Side::Right, 80, 16);
         assert_eq!(
             rows[15].trim_end(),
-            " ↑↓ select  1 answer  d delete  q quit"
+            " ↑↓ select  1 answer  Enter attach  d delete  q quit"
         );
 
         let mut app = App::default();
@@ -404,7 +404,10 @@ mod tests {
         let rows = render(&app, Side::Right, 80, 16);
         let no_box = !rows.iter().any(|r| r.contains("[ 1"));
         assert!(no_box, "no box without options");
-        assert_eq!(rows[15].trim_end(), " ↑↓ select  d delete  q quit");
+        assert_eq!(
+            rows[15].trim_end(),
+            " ↑↓ select  Enter attach  d delete  q quit"
+        );
     }
 
     #[test]
