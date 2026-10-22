@@ -1,9 +1,11 @@
 use std::cell::{Cell, RefCell};
 use std::time::Instant;
 
-use hailr_core::protocol::{PaneId, Question, QuestionId};
+use hailr_core::protocol::{PaneId, Question, QuestionBody, QuestionId};
 use ratatui::layout::{Position, Rect};
 use ratatui::text::Text;
+
+use crate::broker::MAX_REPLY;
 
 /// pane の画面を読んだ結果。読めなかったときは理由を持つ
 pub type Shot = (PaneId, Result<Text<'static>, String>);
@@ -38,12 +40,25 @@ pub struct App {
     targets: RefCell<Vec<(Rect, Target)>>,
     answered: Option<Answered>,
     answered_for: Option<std::time::Duration>,
+    replying: Option<Replying>,
+}
+
+struct Replying {
+    id: QuestionId,
+    text: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Choice {
+    /// 0 から数えたボタンの位置
+    Button(usize),
+    Reply(String),
 }
 
 /// 押したボタンが効いたと分かるよう、答えた質問を期限まで一覧に残す
 struct Answered {
     question: Question,
-    button: usize,
+    choice: Choice,
     until: Instant,
 }
 
@@ -146,20 +161,73 @@ impl App {
         self.answered_for.unwrap_or(super::ANSWERED_FOR)
     }
 
-    pub fn set_answered(&mut self, question: Question, button: usize, until: Instant) {
+    pub fn set_answered(&mut self, question: Question, choice: Choice, until: Instant) {
         self.answered = Some(Answered {
             question,
-            button,
+            choice,
             until,
         });
     }
 
-    /// 答えたばかりで残している質問なら、押したボタンの位置
-    pub fn answered_button(&self, id: QuestionId) -> Option<usize> {
+    /// 答えたばかりで残している質問なら、答えに使ったもの
+    pub fn answered_with(&self, id: QuestionId) -> Option<&Choice> {
         self.answered
             .as_ref()
             .filter(|a| a.question.id == id)
-            .map(|a| a.button)
+            .map(|a| &a.choice)
+    }
+
+    /// 選んでいる質問に返事を打ち始める。打てない質問なら何もしない
+    pub fn start_reply(&mut self) {
+        if let Some(question) = self.selected()
+            && matches!(question.body, QuestionBody::Ask { .. })
+        {
+            self.replying = Some(Replying {
+                id: question.id,
+                text: String::new(),
+            });
+        }
+    }
+
+    pub fn reply(&self) -> Option<(QuestionId, &str)> {
+        self.replying.as_ref().map(|r| (r.id, r.text.as_str()))
+    }
+
+    /// 返事先が選択から外れたり選択が勝手に戻ったりしても、打ち続けたキーがコマンドとして効かないよう Esc まで枠を閉じない
+    pub fn reply_gone(&self) -> bool {
+        self.replying
+            .as_ref()
+            .is_some_and(|r| self.moved || self.selected().is_none_or(|q| q.id != r.id))
+    }
+
+    /// 改行やタブで 1 行の枠が崩れないよう、制御文字は空白にして足す。上限を超える分は捨てて知らせる
+    pub fn type_reply(&mut self, text: &str) {
+        if self.reply_gone() {
+            return;
+        }
+        let Some(replying) = self.replying.as_mut() else {
+            return;
+        };
+        let text = text.replace("\r\n", "\n");
+        let room = MAX_REPLY.saturating_sub(replying.text.chars().count());
+        let typed = text.chars().map(|c| if c.is_control() { ' ' } else { c });
+        replying.text.extend(typed.clone().take(room));
+        if typed.count() > room {
+            self.notice = Some(format!("a reply is limited to {MAX_REPLY} characters"));
+        }
+    }
+
+    pub fn erase_reply(&mut self) {
+        if self.reply_gone() {
+            return;
+        }
+        if let Some(replying) = self.replying.as_mut() {
+            replying.text.pop();
+        }
+    }
+
+    pub fn take_reply(&mut self) -> Option<(QuestionId, String)> {
+        self.replying.take().map(|r| (r.id, r.text))
     }
 
     pub fn answered_until(&self) -> Option<Instant> {
@@ -176,7 +244,7 @@ impl App {
 
     pub fn selected_is_answered(&self) -> bool {
         self.selected()
-            .is_some_and(|q| self.answered_button(q.id).is_some())
+            .is_some_and(|q| self.answered_with(q.id).is_some())
     }
 
     /// 一覧が変わって選択が移ったまま、人がまだ選び直していない
@@ -352,5 +420,68 @@ mod tests {
         assert_eq!(app.shot(), Some(&Err("failed".into())));
         app.select_next();
         assert!(app.shot().is_none(), "the old pane's result is hidden");
+    }
+
+    #[test]
+    fn keeps_a_reply_on_one_line_and_within_the_limit() {
+        let mut app = App::default();
+        let q = question("w1:p1");
+        app.set_questions(vec![q.clone()]);
+        app.type_reply("ignored before r");
+        assert_eq!(app.reply(), None);
+
+        app.start_reply();
+        app.type_reply("a\r\nb");
+        assert_eq!(app.reply(), Some((q.id, "a b")));
+        app.take_reply();
+        app.start_reply();
+        app.type_reply("a\tb\nc");
+        app.erase_reply();
+        assert_eq!(app.reply(), Some((q.id, "a b ")));
+        app.type_reply(&"x".repeat(MAX_REPLY - 4));
+        assert_eq!(app.notice(), None, "exactly at the limit");
+        app.type_reply("y");
+        assert_eq!(app.reply().unwrap().1.chars().count(), MAX_REPLY);
+        assert!(app.notice().unwrap().contains("limited"));
+    }
+
+    #[test]
+    fn opens_no_reply_for_a_permission_request() {
+        let mut app = App::default();
+        let mut q = question("w1:p1");
+        q.body = QuestionBody::Permission {
+            request_id: "abcde".into(),
+            tool_name: "Bash".into(),
+            description: "d".into(),
+            input_preview: "p".into(),
+        };
+        app.set_questions(vec![q]);
+        app.start_reply();
+        assert_eq!(app.reply(), None);
+    }
+
+    #[test]
+    fn keeps_the_reply_box_when_its_question_goes_away() {
+        let mut app = App::default();
+        let q = question("w1:p1");
+        app.set_questions(vec![q.clone()]);
+        app.start_reply();
+        app.type_reply("half");
+        app.set_questions(vec![q.clone(), question("w1:p2")]);
+        assert!(app.reply().is_some(), "another question arriving keeps it");
+        app.set_questions(vec![]);
+        assert!(
+            app.reply_gone(),
+            "the box stays so the typed keys are not commands"
+        );
+        app.type_reply("q");
+        app.erase_reply();
+        assert_eq!(app.reply(), Some((q.id, "half")));
+        assert_eq!(app.notice(), None);
+        app.set_questions(vec![q.clone()]);
+        assert!(
+            app.reply_gone(),
+            "asked again, it still waits for Esc like the buttons"
+        );
     }
 }

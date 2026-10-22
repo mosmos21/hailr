@@ -467,3 +467,38 @@ fn reports_changes() {
     // connect・登録 2 回・回答・取り下げ・切断
     assert_eq!(*changes.borrow(), 6);
 }
+
+#[test]
+fn takes_a_typed_reply_for_questions_only() {
+    let broker = Broker::new();
+    let c = client();
+    let (mut rx, _guard) = broker.connect(c);
+    let q = ask(c, 1, &["Yes"]);
+    broker.register(q.clone()).unwrap();
+    assert_eq!(broker.reply(&q.id, " \t".into()), Err(AnswerError::Empty));
+    let long = "あ".repeat(MAX_REPLY + 1);
+    assert_eq!(broker.reply(&q.id, long), Err(AnswerError::TooLong));
+    broker.reply(&q.id, "あ".repeat(MAX_REPLY)).unwrap();
+    assert_eq!(
+        rx.try_recv().unwrap(),
+        ClientEvent::Answered {
+            id: q.id,
+            answer: "あ".repeat(MAX_REPLY)
+        }
+    );
+    assert_eq!(broker.snapshot(), vec![]);
+    assert_eq!(broker.reply(&q.id, "x".into()), Err(AnswerError::NotFound));
+
+    let mut permission = ask(c, 2, &[]);
+    permission.body = QuestionBody::Permission {
+        request_id: "abcde".into(),
+        tool_name: "Bash".into(),
+        description: "d".into(),
+        input_preview: "p".into(),
+    };
+    broker.register(permission.clone()).unwrap();
+    assert_eq!(
+        broker.reply(&permission.id, "Allow".into()),
+        Err(AnswerError::NotAQuestion)
+    );
+}
