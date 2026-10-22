@@ -101,7 +101,7 @@ mod tests {
             }
             Ok(format!("screen of {}", pane.0))
         }
-        fn attach_command(&self, _: &PaneId) -> Command {
+        fn attach_command(&self, _: &PaneId) -> Result<Command, MuxError> {
             unimplemented!()
         }
         fn notify(&self, _: &str, _: &str) -> Result<(), MuxError> {

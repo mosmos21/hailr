@@ -66,7 +66,7 @@ mod tests {
         fn read_pane(&self, _: &PaneId) -> Result<String, MuxError> {
             unimplemented!()
         }
-        fn attach_command(&self, _: &PaneId) -> Command {
+        fn attach_command(&self, _: &PaneId) -> Result<Command, MuxError> {
             unimplemented!()
         }
         fn notify(&self, _: &str, _: &str) -> Result<(), MuxError> {

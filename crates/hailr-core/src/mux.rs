@@ -8,7 +8,7 @@ pub trait Mux: Send + Sync {
     fn list_panes(&self) -> Result<Vec<PaneInfo>, MuxError>;
     /// ANSI のエスケープを含む、表示中の画面
     fn read_pane(&self, pane: &PaneId) -> Result<String, MuxError>;
-    fn attach_command(&self, pane: &PaneId) -> Command;
+    fn attach_command(&self, pane: &PaneId) -> Result<Command, MuxError>;
     fn notify(&self, title: &str, body: &str) -> Result<(), MuxError>;
 }
 

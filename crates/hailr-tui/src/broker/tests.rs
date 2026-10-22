@@ -409,6 +409,27 @@ fn reconcile_withdraws_once_the_attached_pane_waits_then_works() {
 }
 
 #[test]
+fn reconcile_keeps_the_wait_seen_during_the_attach() {
+    let broker = Broker::new();
+    let c = client();
+    let (mut rx, _guard) = broker.connect(c);
+    let q = ask(c, 1, &[]);
+    broker.register(q.clone()).unwrap();
+    broker.mark_attached(&q.id);
+    poll(&broker, AgentStatus::Idle);
+
+    broker.mark_attached(&q.id);
+    poll(&broker, AgentStatus::Working);
+    assert_eq!(
+        rx.try_recv().unwrap(),
+        ClientEvent::Withdrawn {
+            id: q.id,
+            reason: WithdrawReason::AnsweredInPane
+        }
+    );
+}
+
+#[test]
 fn reconcile_ignores_a_listing_started_before_the_attach() {
     let broker = Broker::new();
     let c = client();

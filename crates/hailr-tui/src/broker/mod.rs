@@ -220,12 +220,15 @@ impl Broker {
         }
     }
 
-    /// つなぎ直しで写しが作り直されると印も消えるので、TUI は attach から戻ったときにも呼び直す
+    /// つなぎ直しで写しが作り直されると印も消えるので、TUI は attach から戻ったときにも呼び直す。
+    /// attach の間に待ちを見ていたら、戻ってすぐ答えが始まっても数えられるよう、そのままにする
     pub fn mark_attached(&self, id: &QuestionId) {
         let mut state = self.lock();
         state.attaches += 1;
         let seq = state.attaches;
-        if let Some(entry) = state.questions.get_mut(id) {
+        if let Some(entry) = state.questions.get_mut(id)
+            && entry.attach != Attach::Armed
+        {
             entry.attach = Attach::Marked(seq);
         }
     }
