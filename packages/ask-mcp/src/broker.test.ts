@@ -4,7 +4,7 @@ import http from "node:http";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
-import { afterEach, expect, test, vi } from "vitest";
+import { afterEach, expect, onTestFinished, test, vi } from "vitest";
 
 import { Broker, BrokerUnavailable, type Question, Rejected } from "./broker.ts";
 
@@ -25,6 +25,7 @@ type Reply = [number, string] | "silent" | "cut";
 
 /** broker の代わりに、SSE をつないだ client の質問だけを受け付ける */
 async function fakeBroker(reply: () => Reply = () => [201, ""], headerDelayMs = 0) {
+  const sse = new Map<string, http.ServerResponse>();
   const socket = path.join(tempDir(), "broker.sock");
   const streams = new Map<string, number>();
   const received: Question[] = [];
@@ -36,6 +37,7 @@ async function fakeBroker(reply: () => Reply = () => [201, ""], headerDelayMs = 
       const headers = setTimeout(() => {
         response.writeHead(200, { "content-type": "text/event-stream" });
         response.write(":\n\n");
+        sse.set(client, response);
       }, headerDelayMs);
       request.on("close", () => {
         clearTimeout(headers);
@@ -66,7 +68,7 @@ async function fakeBroker(reply: () => Reply = () => [201, ""], headerDelayMs = 
     server.closeAllConnections();
     server.close();
   });
-  return { socket, received, server, streams };
+  return { socket, received, server, streams, sse };
 }
 
 function question(clientId: string): Question {
@@ -168,4 +170,44 @@ test("gives up on a broker that is missing or silent", async () => {
   cleanups.push(() => broker.close());
   await broker.connect();
   await expect(broker.register(question(client))).rejects.toBeInstanceOf(BrokerUnavailable);
+});
+
+test("hands events to the listener", async () => {
+  const fake = await fakeBroker();
+  const client = randomUUID();
+  const broker = new Broker(fake.socket, client);
+  cleanups.push(() => broker.close());
+  const events: unknown[] = [];
+  broker.onEvent = (event) => events.push(event);
+  await broker.connect();
+
+  const stream = fake.sse.get(client);
+  const yes = Buffer.from('data: {"type":"answered","id":"q1","answer":"はい"}\n\n');
+  const cut = yes.indexOf(Buffer.from("は")) + 1;
+  stream?.write(yes.subarray(0, cut));
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  stream?.write(yes.subarray(cut));
+  await vi.waitFor(() => expect(events).toHaveLength(1));
+  stream?.write('data: not json\n\ndata: {"type":"other"}\n\n');
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  stream?.write('data: {"type":"withdrawn","id":"q2","reason":"deleted"}\n\n');
+  await vi.waitFor(() =>
+    expect(events).toEqual([
+      { type: "answered", id: "q1", answer: "はい" },
+      { type: "withdrawn", id: "q2", reason: "deleted" },
+    ]),
+  );
+});
+
+test("drops a connection that sends an endless event", async () => {
+  const fake = await fakeBroker();
+  const client = randomUUID();
+  const broker = new Broker(fake.socket, client);
+  cleanups.push(() => broker.close());
+  const log = vi.spyOn(console, "error").mockImplementation(() => {});
+  onTestFinished(() => log.mockRestore());
+  await broker.connect();
+  fake.sse.get(client)?.write(`data: ${"x".repeat((1 << 20) + 1)}`);
+  await vi.waitFor(() => expect(fake.streams.get(client)).toBe(0));
+  expect(log).toHaveBeenCalledWith(expect.stringContaining("too long"));
 });

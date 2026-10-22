@@ -1,5 +1,7 @@
 import http from "node:http";
 
+import { type ClientEvent, clientEvent, readSse } from "./events.ts";
+
 /** broker が動いていない、または答えない */
 export class BrokerUnavailable extends Error {}
 
@@ -20,10 +22,15 @@ export type Question = {
   };
 };
 
+/** 区切りが来ないまま伸び続ける SSE を読み続けないため、1 件の上限を文字数で置く */
+const MAX_PENDING_EVENT = 1 << 20;
+
 export class Broker {
   readonly socketPath: string;
   readonly clientId: string;
   readonly timeoutMs: number;
+  /** SSE で出来事が届いたとき */
+  onEvent: (event: ClientEvent) => void = () => {};
   #events: http.ClientRequest | undefined;
   #opening: http.ClientRequest | undefined;
   #connecting: Promise<void> | undefined;
@@ -75,7 +82,20 @@ export class Broker {
           request.setTimeout(0);
           this.#events = request;
           response.on("close", () => this.#forget(request));
-          response.resume();
+          let buffer = "";
+          response.setEncoding("utf8");
+          response.on("data", (chunk: string) => {
+            const read = readSse(buffer + chunk);
+            buffer = read.rest;
+            if (buffer.length > MAX_PENDING_EVENT) {
+              console.error("hailr: an event too long to read; disconnected until the next ask_human");
+              request.destroy();
+              return;
+            }
+            for (const data of read.data) {
+              this.#deliver(data);
+            }
+          });
           resolve();
         },
       );
@@ -134,7 +154,7 @@ export class Broker {
       // broker はもうこの client を知らないので、次の呼び出しでつなぎ直させる。その間に張り直した接続は切らない
       if (events && this.#events === events) {
         events.destroy();
-        this.#events = undefined;
+        this.#forget(events);
       }
       throw new BrokerUnavailable("the broker forgot this client");
     }
@@ -154,5 +174,21 @@ export class Broker {
     if (this.#events === request) {
       this.#events = undefined;
     }
+  }
+
+  #deliver(data: string): void {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(data);
+    } catch {
+      console.error("hailr: an event that is not JSON");
+      return;
+    }
+    const event = clientEvent.safeParse(parsed);
+    if (!event.success) {
+      console.error("hailr: an event of an unknown shape");
+      return;
+    }
+    this.onEvent(event.data);
   }
 }
