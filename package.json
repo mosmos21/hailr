@@ -3,6 +3,8 @@
   "private": true,
   "packageManager": "pnpm@11.1.2",
   "scripts": {
-    "check": "pnpm -r run check"
+    "check": "pnpm check:rust && pnpm check:node",
+    "check:rust": "cargo fmt --all --check && cargo clippy --locked --all-targets -- -D warnings && cargo test --locked",
+    "check:node": "pnpm -r run check"
   }
 }
