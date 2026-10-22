@@ -1,3 +1,5 @@
+use std::cell::Cell;
+
 use hailr_core::protocol::{PaneId, Question, QuestionId};
 use ratatui::text::Text;
 
@@ -10,6 +12,11 @@ pub struct App {
     questions: Vec<Question>,
     selected: Option<QuestionId>,
     shot: Option<Shot>,
+    notice: Option<String>,
+    /// 選んでいた質問が消えてから、人がまだ選び直していない。一覧が空を挟んでも消さない
+    moved: bool,
+    /// 直前の描画で見えていたボタンの数。見えていない番号では答えさせない
+    shown_buttons: Cell<usize>,
 }
 
 impl App {
@@ -19,6 +26,9 @@ impl App {
         self.questions = questions;
         if self.selected_index().is_none() {
             let last = self.questions.len().checked_sub(1);
+            if self.selected.is_some() {
+                self.moved = true;
+            }
             self.selected = last.map(|last| self.questions[position.min(last)].id);
         }
     }
@@ -41,6 +51,19 @@ impl App {
     /// 選ぶ pane が変わったら呼ぶ。前に読んだ同じ pane の古い画面を、読み直すまで出さない
     pub fn forget_shot(&mut self) {
         self.shot = None;
+    }
+
+    /// キーの案内の代わりに出す 1 行。次にキーを押したら消す
+    pub fn set_notice(&mut self, notice: impl Into<String>) {
+        self.notice = Some(notice.into());
+    }
+
+    pub fn clear_notice(&mut self) {
+        self.notice = None;
+    }
+
+    pub fn notice(&self) -> Option<&str> {
+        self.notice.as_deref()
     }
 
     pub fn questions(&self) -> &[Question] {
@@ -66,10 +89,24 @@ impl App {
         (Some(pane) == self.selected().map(|q| &q.pane_id)).then_some(result)
     }
 
+    /// 一覧が変わって選択が移ったまま、人がまだ選び直していない
+    pub fn moved_on_its_own(&self) -> bool {
+        self.moved
+    }
+
+    pub fn set_shown_buttons(&self, count: usize) {
+        self.shown_buttons.set(count);
+    }
+
+    pub fn shown_buttons(&self) -> usize {
+        self.shown_buttons.get()
+    }
+
     fn move_selection(&mut self, step: impl Fn(usize) -> usize) {
         let Some(current) = self.selected_index() else {
             return;
         };
+        self.moved = false;
         let next = step(current).min(self.questions.len() - 1);
         self.selected = Some(self.questions[next].id);
     }
@@ -138,6 +175,27 @@ mod tests {
             app.selected().unwrap().id,
             c.id,
             "same position, not the last"
+        );
+    }
+
+    #[test]
+    fn marks_a_selection_that_moved_until_the_person_chooses() {
+        let mut app = App::default();
+        let [a, b] = [question("a"), question("b")];
+        app.set_questions(vec![a.clone()]);
+        assert!(!app.moved_on_its_own(), "the first selection is not a move");
+        app.set_questions(vec![a.clone(), b.clone()]);
+        assert!(!app.moved_on_its_own(), "kept");
+        app.set_questions(vec![b.clone()]);
+        assert!(app.moved_on_its_own());
+        app.select_previous();
+        assert!(!app.moved_on_its_own());
+
+        app.set_questions(vec![]);
+        app.set_questions(vec![a.clone()]);
+        assert!(
+            app.moved_on_its_own(),
+            "an empty list in between keeps the mark"
         );
     }
 
