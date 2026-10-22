@@ -40,8 +40,8 @@ pub fn draw(frame: &mut Frame, app: &App, side: Side) {
         None => draw_empty(frame, Block::bordered().border_style(MUTED), main),
     }
     let footer_line = match app.notice() {
+        _ if app.reply_gone() => Line::styled(" the question went away  Esc close", WARNING),
         Some(notice) => Line::styled(format!(" {}", printable(notice)), WARNING),
-        None if app.reply_gone() => Line::styled(" the question went away  Esc close", WARNING),
         None => Line::styled(keys(app), MUTED),
     };
     frame.render_widget(footer_line, footer);
@@ -728,10 +728,17 @@ mod tests {
         let mut app = App::default();
         app.set_questions(vec![with_options(&["Yes"])]);
         app.start_reply();
-        app.type_reply("half");
-        app.set_questions(vec![]);
+        app.type_reply(&"h".repeat(crate::broker::MAX_REPLY + 1));
+        assert!(app.notice().is_some());
+        app.set_questions(vec![with_options(&["No"])]);
         let rows = render(&app, Side::Right, 80, 16);
         assert_eq!(rows[15].trim_end(), " the question went away  Esc close");
+        let text = rows.join("\n");
+        assert!(
+            !text.contains("┌Reply"),
+            "no box under another question\n{text}"
+        );
+        assert!(!text.contains("hhh"), "{text}");
     }
 
     #[test]

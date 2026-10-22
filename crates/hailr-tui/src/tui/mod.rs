@@ -770,14 +770,32 @@ mod tests {
         apply(&mut app, &broker, Action::Previous);
 
         on_event(&mut app, &broker, &char('r'));
+        let ignored = [
+            press(KeyCode::Down, KeyModifiers::NONE),
+            press(KeyCode::Char('q'), KeyModifiers::ALT),
+        ];
+        app.set_notice("old");
+        for key in &ignored {
+            assert_eq!(on_event(&mut app, &broker, key), Step::Nothing);
+        }
+        assert_eq!(
+            app.selected().map(|q| q.id),
+            Some(first.id),
+            "↓ while typing"
+        );
         on_event(&mut app, &broker, &char('x'));
+        assert_eq!(app.notice(), None, "a typed key clears the notice");
         broker.withdraw(&first.id, WithdrawReason::Deleted);
         assert!(events.try_recv().is_ok());
         app.set_questions(broker.snapshot());
         assert!(app.reply_gone());
-        for key in [char('j'), char('d'), char('1'), char('q')] {
-            assert_eq!(on_event(&mut app, &broker, &key), Step::Nothing);
+        for key in [char('j'), char('d'), char('1'), char('q')]
+            .iter()
+            .chain(&ignored)
+        {
+            assert_eq!(on_event(&mut app, &broker, key), Step::Nothing);
         }
+        assert_eq!(app.selected().map(|q| q.id), Some(second.id));
         assert!(events.try_recv().is_err(), "nothing answered");
         assert_eq!(broker.snapshot(), vec![second]);
         broker.register(first.clone()).unwrap();

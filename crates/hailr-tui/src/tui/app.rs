@@ -193,11 +193,11 @@ impl App {
         self.replying.as_ref().map(|r| (r.id, r.text.as_str()))
     }
 
-    /// 返事先が選択から外れても、打ち続けたキーがコマンドとして効かないよう Esc まで枠を閉じない
+    /// 返事先が選択から外れたり選択が勝手に戻ったりしても、打ち続けたキーがコマンドとして効かないよう Esc まで枠を閉じない
     pub fn reply_gone(&self) -> bool {
         self.replying
             .as_ref()
-            .is_some_and(|r| self.selected().is_none_or(|q| q.id != r.id))
+            .is_some_and(|r| self.moved || self.selected().is_none_or(|q| q.id != r.id))
     }
 
     /// 改行やタブで 1 行の枠が崩れないよう、制御文字は空白にして足す。上限を超える分は捨てて知らせる
@@ -480,8 +480,8 @@ mod tests {
         assert_eq!(app.notice(), None);
         app.set_questions(vec![q.clone()]);
         assert!(
-            !app.reply_gone(),
-            "asked again and selected, the reply goes on"
+            app.reply_gone(),
+            "asked again, it still waits for Esc like the buttons"
         );
     }
 }
