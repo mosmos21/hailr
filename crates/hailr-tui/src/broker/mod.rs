@@ -33,27 +33,27 @@ struct State {
     questions: HashMap<QuestionId, Entry>,
     clients: HashMap<ClientId, Client>,
     next_connection: u64,
-    attaches: u64,
+    focuses: u64,
     /// つなぎ直した ask-mcp の再登録で鳴らし直さないよう、回答・取り下げまで覚えておく
     notified: HashSet<QuestionId>,
 }
 
 struct Entry {
     question: Question,
-    attach: Attach,
+    focus: Focus,
 }
 
-/// TUI から pane に attach したあと、pane が待ち（idle / blocked）を経て working になったら、人が pane で答えたとみなす
+/// TUI から herdr の画面を pane へ移したあと、pane が待ち（idle / blocked）を経て working になったら、人が pane で答えたとみなす
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Attach {
+enum Focus {
     No,
-    /// attach したが、まだ待ちを見ていない。attach の前から別の作業で working のことがあるため。値は attach の通し番号
+    /// focus したが、まだ待ちを見ていない。focus の前から別の作業で working のことがあるため。値は focus の通し番号
     Marked(u64),
-    /// attach したあとに待ちを見た。次に working になったら答えたとみなす
+    /// focus したあとに待ちを見た。次に working になったら答えたとみなす
     Armed,
 }
 
-/// 一覧を取り始めた時点を表す。これより後の attach は、この一覧では進めない
+/// 一覧を取り始めた時点を表す。これより後の focus は、この一覧では進めない
 #[derive(Clone, Copy, Debug)]
 pub struct ListingStart(u64);
 
@@ -169,7 +169,7 @@ impl Broker {
                     question.id,
                     Entry {
                         question,
-                        attach: Attach::No,
+                        focus: Focus::No,
                     },
                 );
                 Registered::New
@@ -256,25 +256,26 @@ impl Broker {
         }
     }
 
-    /// つなぎ直しで写しが作り直されると印も消えるので、TUI は attach から戻ったときにも呼び直す。
-    /// attach の間に待ちを見ていたら、戻ってすぐ答えが始まっても数えられるよう、そのままにする
-    pub fn mark_attached(&self, id: &QuestionId) {
+    /// 印は権限確認にだけ付ける。ask の答えは channel で届き、画面を移しただけの質問を別の作業で取り下げると
+    /// Claude が答えを待ち続けるため。待ちをすでに見ていたら、続けて答えが始まっても数えられるよう、そのままにする
+    pub fn mark_focused(&self, id: &QuestionId) {
         let mut state = self.lock();
-        state.attaches += 1;
-        let seq = state.attaches;
+        state.focuses += 1;
+        let seq = state.focuses;
         if let Some(entry) = state.questions.get_mut(id)
-            && entry.attach != Attach::Armed
+            && matches!(entry.question.body, QuestionBody::Permission { .. })
+            && entry.focus != Focus::Armed
         {
-            entry.attach = Attach::Marked(seq);
+            entry.focus = Focus::Marked(seq);
         }
     }
 
     /// 一覧を取り始める直前に呼び、その一覧を渡す `reconcile_panes` に渡す
     pub fn listing_start(&self) -> ListingStart {
-        ListingStart(self.lock().attaches)
+        ListingStart(self.lock().focuses)
     }
 
-    /// attach して pane で答えた質問を取り下げる。pane が一覧に無いだけでは取り下げない。herdr の一覧は
+    /// 画面を移したあと pane で答えた権限確認を取り下げる。pane が一覧に無いだけでは取り下げない。herdr の一覧は
     /// agent の居る pane しか返さず、pane が閉じたときは ask-mcp の接続が切れてその質問が消えるため
     pub fn reconcile_panes(&self, start: ListingStart, panes: &[PaneInfo]) {
         let mut state = self.lock();
@@ -284,10 +285,10 @@ impl Broker {
                 continue;
             };
             let waiting = matches!(pane.status, AgentStatus::Idle | AgentStatus::Blocked);
-            match entry.attach {
-                // attach より前に取り始めた一覧は attach 前の様子なので、待ちに見えても進めない
-                Attach::Marked(seq) if waiting && seq <= start.0 => entry.attach = Attach::Armed,
-                Attach::Armed if pane.status == AgentStatus::Working => {
+            match entry.focus {
+                // focus より前に取り始めた一覧は focus 前の様子なので、待ちに見えても進めない
+                Focus::Marked(seq) if waiting && seq <= start.0 => entry.focus = Focus::Armed,
+                Focus::Armed if pane.status == AgentStatus::Working => {
                     answered.push(entry.question.id)
                 }
                 _ => {}

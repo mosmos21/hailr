@@ -23,6 +23,17 @@ fn ask(client: ClientId, asked_at: u64, options: &[&str]) -> Question {
     }
 }
 
+fn permission(client: ClientId, asked_at: u64) -> Question {
+    let mut question = ask(client, asked_at, &[]);
+    question.body = QuestionBody::Permission {
+        request_id: "abcde".into(),
+        tool_name: "Bash".into(),
+        description: "d".into(),
+        input_preview: "p".into(),
+    };
+    question
+}
+
 fn pane(id: &str, status: AgentStatus) -> PaneInfo {
     PaneInfo {
         id: PaneId(id.into()),
@@ -307,18 +318,18 @@ fn announces_again_once_a_question_is_settled() {
     let (_rx, _guard) = broker.connect(c);
     type Settle = fn(&Broker, &Question);
     let settles: [(&str, Settle); 3] = [
-        ("answer", |b, q| b.answer(&q.id, "Yes".into()).unwrap()),
+        ("answer", |b, q| b.answer(&q.id, "Allow".into()).unwrap()),
         ("withdraw", |b, q| {
             b.withdraw(&q.id, WithdrawReason::Deleted)
         }),
         ("answered in the pane", |b, q| {
-            b.mark_attached(&q.id);
+            b.mark_focused(&q.id);
             poll(b, AgentStatus::Idle);
             poll(b, AgentStatus::Working);
         }),
     ];
     for (name, settle) in settles {
-        let q = ask(c, 1, &["Yes"]);
+        let q = permission(c, 1);
         broker.register(q.clone()).unwrap();
         settle(&broker, &q);
         broker.register(q.clone()).unwrap();
@@ -335,7 +346,7 @@ fn announces_after_a_reconnect_only_if_the_notifier_missed_it() {
     let mut arrivals = broker.arrivals();
     let c = client();
     for missed in [false, true] {
-        let q = ask(c, 1, &[]);
+        let q = permission(c, 1);
         let (_rx, guard) = broker.connect(c);
         broker.register(q.clone()).unwrap();
         if !missed {
@@ -358,26 +369,26 @@ fn poll(broker: &Broker, status: AgentStatus) {
 }
 
 #[test]
-fn reconcile_keeps_questions_of_unlisted_and_unattached_panes() {
+fn reconcile_keeps_questions_of_unlisted_and_unfocused_panes() {
     let broker = Broker::new();
     let c = client();
     let (mut rx, _guard) = broker.connect(c);
-    let mut unlisted = ask(c, 1, &[]);
+    let mut unlisted = permission(c, 1);
     unlisted.pane_id = PaneId("w1:p9".into());
-    let unattached = ask(c, 2, &[]);
+    let unfocused = permission(c, 2);
     broker.register(unlisted.clone()).unwrap();
-    broker.register(unattached.clone()).unwrap();
-    broker.mark_attached(&unlisted.id);
+    broker.register(unfocused.clone()).unwrap();
+    broker.mark_focused(&unlisted.id);
 
     for status in [AgentStatus::Idle, AgentStatus::Working] {
         poll(&broker, status);
     }
     assert!(rx.try_recv().is_err());
-    assert_eq!(broker.snapshot(), vec![unlisted, unattached]);
+    assert_eq!(broker.snapshot(), vec![unlisted, unfocused]);
 }
 
 #[test]
-fn reconcile_withdraws_once_the_attached_pane_waits_then_works() {
+fn reconcile_withdraws_once_the_focused_pane_waits_then_works() {
     for (waiting, arms) in [
         (AgentStatus::Idle, true),
         (AgentStatus::Blocked, true),
@@ -387,11 +398,25 @@ fn reconcile_withdraws_once_the_attached_pane_waits_then_works() {
         let broker = Broker::new();
         let c = client();
         let (mut rx, _guard) = broker.connect(c);
-        let q = ask(c, 1, &[]);
+        let q = permission(c, 1);
         broker.register(q.clone()).unwrap();
-        broker.mark_attached(&q.id);
+        broker.mark_focused(&q.id);
 
         poll(&broker, waiting.clone());
+        if arms {
+            for still in [
+                AgentStatus::Idle,
+                AgentStatus::Blocked,
+                AgentStatus::Other("unknown".into()),
+            ] {
+                poll(&broker, still);
+                assert_eq!(
+                    broker.snapshot(),
+                    vec![q.clone()],
+                    "{waiting:?}: not until working"
+                );
+            }
+        }
         poll(&broker, AgentStatus::Working);
         if arms {
             assert_eq!(
@@ -409,16 +434,16 @@ fn reconcile_withdraws_once_the_attached_pane_waits_then_works() {
 }
 
 #[test]
-fn reconcile_keeps_the_wait_seen_during_the_attach() {
+fn reconcile_keeps_the_wait_seen_before_focusing_again() {
     let broker = Broker::new();
     let c = client();
     let (mut rx, _guard) = broker.connect(c);
-    let q = ask(c, 1, &[]);
+    let q = permission(c, 1);
     broker.register(q.clone()).unwrap();
-    broker.mark_attached(&q.id);
+    broker.mark_focused(&q.id);
     poll(&broker, AgentStatus::Idle);
 
-    broker.mark_attached(&q.id);
+    broker.mark_focused(&q.id);
     poll(&broker, AgentStatus::Working);
     assert_eq!(
         rx.try_recv().unwrap(),
@@ -430,18 +455,35 @@ fn reconcile_keeps_the_wait_seen_during_the_attach() {
 }
 
 #[test]
-fn reconcile_ignores_a_listing_started_before_the_attach() {
+fn reconcile_ignores_a_listing_started_before_the_focus() {
     let broker = Broker::new();
     let c = client();
     let (_rx, _guard) = broker.connect(c);
-    let q = ask(c, 1, &[]);
+    let q = permission(c, 1);
     broker.register(q.clone()).unwrap();
 
     let start = broker.listing_start();
-    broker.mark_attached(&q.id);
+    broker.mark_focused(&q.id);
     broker.reconcile_panes(start, &[pane("w1:p1", AgentStatus::Idle)]);
     poll(&broker, AgentStatus::Working);
     assert_eq!(broker.snapshot(), vec![q]);
+}
+
+#[test]
+fn reconcile_never_withdraws_an_ask_question() {
+    let broker = Broker::new();
+    let c = client();
+    let (_rx, _guard) = broker.connect(c);
+    let q = ask(c, 1, &["Yes"]);
+    broker.register(q.clone()).unwrap();
+    broker.mark_focused(&q.id);
+    poll(&broker, AgentStatus::Idle);
+    poll(&broker, AgentStatus::Working);
+    assert_eq!(
+        broker.snapshot(),
+        vec![q],
+        "Claude may be working on something else"
+    );
 }
 
 #[test]

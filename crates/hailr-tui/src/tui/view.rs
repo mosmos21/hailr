@@ -75,12 +75,8 @@ fn keys(app: &App) -> String {
     } else {
         ""
     };
-    if let Some(choice) = app.selected().and_then(|q| app.answered_with(q.id)) {
-        let attach = match choice {
-            Choice::Button(_) => "  Enter attach",
-            Choice::Reply(_) => "",
-        };
-        return format!(" ↑↓ select{open}  f focus{attach}  q quit");
+    if app.selected_is_answered() {
+        return format!(" ↑↓ select{open}  f focus  q quit");
     }
     let reply = if app
         .selected()
@@ -90,7 +86,7 @@ fn keys(app: &App) -> String {
     } else {
         ""
     };
-    format!(" ↑↓ select{answer}{reply}{open}  f focus  Enter attach  d delete  q quit")
+    format!(" ↑↓ select{answer}{reply}{open}  f focus  d delete  q quit")
 }
 
 fn draw_list(frame: &mut Frame, app: &App, area: Rect) {
@@ -664,10 +660,7 @@ mod tests {
         let other = &buffer[(other_x, y)];
         assert!(!other.modifier.contains(Modifier::REVERSED));
         assert_eq!(other.fg, MUTED);
-        assert_eq!(
-            rows[15].trim_end(),
-            " ↑↓ select  f focus  Enter attach  q quit"
-        );
+        assert_eq!(rows[15].trim_end(), " ↑↓ select  f focus  q quit");
     }
 
     #[test]
@@ -722,7 +715,7 @@ mod tests {
         assert_eq!(
             rows[15].trim_end(),
             " ↑↓ select  f focus  q quit",
-            "Enter does not attach right after sending"
+            "the same keys after a reply"
         );
     }
 
@@ -772,7 +765,7 @@ mod tests {
         assert!(buttons > asked, "{}", rows.join("\n"));
         assert_eq!(
             rows[15].trim_end(),
-            " ↑↓ select  1-2 answer  r reply  f focus  Enter attach  d delete  q quit"
+            " ↑↓ select  1-2 answer  r reply  f focus  d delete  q quit"
         );
 
         app.set_questions(vec![with_options(&["Yes"])]);
@@ -788,7 +781,7 @@ mod tests {
         let rows = render(&app, Side::Right, 80, 16);
         assert_eq!(
             rows[15].trim_end(),
-            " ↑↓ select  1 answer  r reply  f focus  Enter attach  d delete  q quit"
+            " ↑↓ select  1 answer  r reply  f focus  d delete  q quit"
         );
 
         let mut app = App::default();
@@ -798,7 +791,7 @@ mod tests {
         assert!(no_box, "no box without options");
         assert_eq!(
             rows[15].trim_end(),
-            " ↑↓ select  r reply  f focus  Enter attach  d delete  q quit"
+            " ↑↓ select  r reply  f focus  d delete  q quit"
         );
     }
 
@@ -854,7 +847,7 @@ mod tests {
         assert!(text.contains("[ 1 Allow ] [ 2 Deny ]"), "{text}");
         assert_eq!(
             rows[15].trim_end(),
-            " ↑↓ select  1-2 answer  f focus  Enter attach  d delete  q quit",
+            " ↑↓ select  1-2 answer  f focus  d delete  q quit",
             "no reply to a permission request"
         );
     }
@@ -974,7 +967,7 @@ mod tests {
         assert_eq!(app.shown_links(), 2);
         assert_eq!(
             rows[29].trim_end(),
-            " ↑↓ select  1-2 answer  r reply  o open  f focus  Enter attach  d delete  q quit"
+            " ↑↓ select  1-2 answer  r reply  o open  f focus  d delete  q quit"
         );
 
         app.start_opening();

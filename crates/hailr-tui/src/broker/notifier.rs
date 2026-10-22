@@ -56,7 +56,6 @@ fn plain(text: &str, max: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::process::Command;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
@@ -79,9 +78,6 @@ mod tests {
             unimplemented!()
         }
         fn read_pane(&self, _: &PaneId) -> Result<String, MuxError> {
-            unimplemented!()
-        }
-        fn attach_command(&self, _: &PaneId) -> Result<Command, MuxError> {
             unimplemented!()
         }
         fn focus(&self, _: &PaneId) -> Result<(), MuxError> {

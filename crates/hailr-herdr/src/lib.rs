@@ -2,7 +2,6 @@ mod agent_list;
 mod cmd;
 
 use std::path::PathBuf;
-use std::process::Command;
 use std::time::Duration;
 
 use hailr_core::mux::{Mux, MuxError, PaneInfo};
@@ -48,13 +47,6 @@ impl Mux for HerdrMux {
         Ok(String::from_utf8_lossy(&out).into_owned())
     }
 
-    fn attach_command(&self, pane: &PaneId) -> Result<Command, MuxError> {
-        let pane = checked(pane)?;
-        let mut command = Command::new(&self.bin);
-        command.args(["agent", "attach", pane]);
-        Ok(command)
-    }
-
     fn focus(&self, pane: &PaneId) -> Result<(), MuxError> {
         let pane = checked(pane)?;
         cmd::run(&self.bin, "agent focus", &["agent", "focus", pane], TIMEOUT).map(|_| ())
@@ -85,7 +77,6 @@ fn displayable(text: &str) -> String {
 mod tests {
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
-    use std::path::Path;
 
     use super::*;
 
@@ -195,20 +186,5 @@ mod tests {
             ["agent", "focus", "w1B:p1"],
             "not called again"
         );
-    }
-
-    #[test]
-    fn attach_command_attaches_to_the_pane() {
-        let mux = HerdrMux::with_bin("herdr");
-        let command = mux.attach_command(&pane("w1B:p1")).unwrap();
-        assert_eq!(command.get_program(), Path::new("herdr"));
-        assert_eq!(
-            command.get_args().collect::<Vec<_>>(),
-            ["agent", "attach", "w1B:p1"]
-        );
-        for id in ["", "-x", "--takeover"] {
-            let refused = mux.attach_command(&pane(id));
-            assert!(matches!(refused, Err(MuxError::InvalidPane)), "{id:?}");
-        }
     }
 }

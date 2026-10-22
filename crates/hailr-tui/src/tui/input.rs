@@ -11,7 +11,6 @@ pub enum Action {
     /// 0 から数えたボタンの位置
     Answer(usize),
     Delete,
-    Attach,
     Focus,
     Open,
     Reply,
@@ -75,7 +74,6 @@ pub fn action(event: &Event) -> Option<Action> {
         KeyCode::Down | KeyCode::Char('j') => Some(Action::Next),
         KeyCode::Char(c @ '1'..='9') if plain => Some(Action::Answer(*c as usize - '1' as usize)),
         KeyCode::Char('d') if plain => Some(Action::Delete),
-        KeyCode::Enter if plain => Some(Action::Attach),
         KeyCode::Char('o') if plain => Some(Action::Open),
         KeyCode::Char('f') if plain => Some(Action::Focus),
         KeyCode::Char('r') if plain => Some(Action::Reply),
@@ -139,9 +137,7 @@ mod tests {
         assert_eq!(press(KeyCode::Char('d'), KeyModifiers::CONTROL), None);
         assert_eq!(press(KeyCode::Char('4'), KeyModifiers::CONTROL), None);
         assert_eq!(press(KeyCode::Char('1'), KeyModifiers::ALT), None);
-        assert_eq!(press(KeyCode::Enter, none), Some(Action::Attach));
-        assert_eq!(press(KeyCode::Enter, KeyModifiers::ALT), None);
-        assert_eq!(press(KeyCode::Enter, KeyModifiers::CONTROL), None);
+        assert_eq!(press(KeyCode::Enter, none), None);
         assert_eq!(press(KeyCode::Char('o'), none), Some(Action::Open));
         assert_eq!(press(KeyCode::Char('f'), none), Some(Action::Focus));
         assert_eq!(press(KeyCode::Char('f'), KeyModifiers::CONTROL), None);
