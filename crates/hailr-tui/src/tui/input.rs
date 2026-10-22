@@ -12,6 +12,7 @@ pub enum Action {
     Answer(usize),
     Delete,
     Attach,
+    Focus,
     Open,
     Reply,
     Click(Target),
@@ -76,6 +77,7 @@ pub fn action(event: &Event) -> Option<Action> {
         KeyCode::Char('d') if plain => Some(Action::Delete),
         KeyCode::Enter if plain => Some(Action::Attach),
         KeyCode::Char('o') if plain => Some(Action::Open),
+        KeyCode::Char('f') if plain => Some(Action::Focus),
         KeyCode::Char('r') if plain => Some(Action::Reply),
         KeyCode::Char('q') => Some(Action::Quit),
         KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => Some(Action::Quit),
@@ -141,6 +143,9 @@ mod tests {
         assert_eq!(press(KeyCode::Enter, KeyModifiers::ALT), None);
         assert_eq!(press(KeyCode::Enter, KeyModifiers::CONTROL), None);
         assert_eq!(press(KeyCode::Char('o'), none), Some(Action::Open));
+        assert_eq!(press(KeyCode::Char('f'), none), Some(Action::Focus));
+        assert_eq!(press(KeyCode::Char('f'), KeyModifiers::CONTROL), None);
+        assert_eq!(press(KeyCode::Char('f'), KeyModifiers::ALT), None);
         assert_eq!(press(KeyCode::Char('o'), KeyModifiers::CONTROL), None);
         assert_eq!(press(KeyCode::Char('o'), KeyModifiers::ALT), None);
         assert_eq!(press(KeyCode::Char('q'), none), Some(Action::Quit));

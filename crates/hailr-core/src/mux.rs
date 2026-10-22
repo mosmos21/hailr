@@ -9,6 +9,7 @@ pub trait Mux: Send + Sync {
     /// ANSI のエスケープを含む、表示中の画面
     fn read_pane(&self, pane: &PaneId) -> Result<String, MuxError>;
     fn attach_command(&self, pane: &PaneId) -> Result<Command, MuxError>;
+    fn focus(&self, pane: &PaneId) -> Result<(), MuxError>;
     fn notify(&self, title: &str, body: &str) -> Result<(), MuxError>;
 }
 

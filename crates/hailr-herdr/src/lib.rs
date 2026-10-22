@@ -55,6 +55,11 @@ impl Mux for HerdrMux {
         Ok(command)
     }
 
+    fn focus(&self, pane: &PaneId) -> Result<(), MuxError> {
+        let pane = checked(pane)?;
+        cmd::run(&self.bin, "agent focus", &["agent", "focus", pane], TIMEOUT).map(|_| ())
+    }
+
     fn notify(&self, title: &str, body: &str) -> Result<(), MuxError> {
         let (title, body) = (displayable(title), displayable(body));
         let args = ["notification", "show", &title, "--body", &body];
@@ -173,6 +178,22 @@ mod tests {
                 "--body",
                 "\u{2010}body - x"
             ]
+        );
+    }
+
+    #[test]
+    fn focuses_the_pane() {
+        let stub = Stub::new("focus", "{}");
+        stub.mux().focus(&pane("w1B:p1")).unwrap();
+        assert_eq!(stub.args(), ["agent", "focus", "w1B:p1"]);
+        for id in ["", "-x", "--help"] {
+            let refused = stub.mux().focus(&pane(id));
+            assert!(matches!(refused, Err(MuxError::InvalidPane)), "{id:?}");
+        }
+        assert_eq!(
+            stub.args(),
+            ["agent", "focus", "w1B:p1"],
+            "not called again"
         );
     }
 
