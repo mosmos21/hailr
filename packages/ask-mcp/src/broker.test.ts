@@ -140,9 +140,12 @@ test("drops a connection the broker no longer knows", async () => {
   const client = randomUUID();
   const broker = new Broker(fake.socket, client);
   cleanups.push(() => broker.close());
+  let lost = 0;
+  broker.onLost = () => lost++;
   await broker.connect();
   await expect(broker.register(question(client))).rejects.toThrow("forgot this client");
   await vi.waitFor(() => expect(fake.streams.get(client)).toBe(0));
+  expect(lost).toBe(1);
   await broker.connect();
   expect(fake.streams.get(client)).toBe(1);
 });
@@ -170,6 +173,22 @@ test("gives up on a broker that is missing or silent", async () => {
   cleanups.push(() => broker.close());
   await broker.connect();
   await expect(broker.register(question(client))).rejects.toBeInstanceOf(BrokerUnavailable);
+});
+
+test("reports a lost connection, but not a closed one", async () => {
+  const fake = await fakeBroker();
+  const client = randomUUID();
+  const broker = new Broker(fake.socket, client);
+  cleanups.push(() => broker.close());
+  let lost = 0;
+  broker.onLost = () => lost++;
+  await broker.connect();
+  fake.server.closeAllConnections();
+  await vi.waitFor(() => expect(lost).toBe(1));
+  await broker.connect();
+  broker.close();
+  await vi.waitFor(() => expect(fake.streams.get(client)).toBe(0));
+  expect(lost).toBe(1);
 });
 
 test("hands events to the listener", async () => {
