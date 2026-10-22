@@ -31,6 +31,8 @@ export class Broker {
   readonly timeoutMs: number;
   /** SSE で出来事が届いたとき */
   onEvent: (event: ClientEvent) => void = () => {};
+  /** つながっていた SSE が close() 以外で切れたとき */
+  onLost: () => void = () => {};
   #events: http.ClientRequest | undefined;
   #opening: http.ClientRequest | undefined;
   #connecting: Promise<void> | undefined;
@@ -88,7 +90,7 @@ export class Broker {
             const read = readSse(buffer + chunk);
             buffer = read.rest;
             if (buffer.length > MAX_PENDING_EVENT) {
-              console.error("hailr: an event too long to read; disconnected until the next ask_human");
+              console.error("hailr: an event too long to read; disconnected");
               request.destroy();
               return;
             }
@@ -173,6 +175,7 @@ export class Broker {
   #forget(request: http.ClientRequest): void {
     if (this.#events === request) {
       this.#events = undefined;
+      this.onLost();
     }
   }
 
