@@ -6,3 +6,5 @@ repository.workspace = true
 
 [dependencies]
 hailr-core.workspace = true
+libc = "0.2"
+wait-timeout = "0.2"
