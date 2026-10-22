@@ -71,6 +71,9 @@ fn keys(app: &App) -> String {
     } else {
         ""
     };
+    if app.selected_is_answered() {
+        return format!(" ↑↓ select{open}  Enter attach  q quit");
+    }
     format!(" ↑↓ select{answer}{open}  Enter attach  d delete  q quit")
 }
 
@@ -104,7 +107,8 @@ fn draw_question(frame: &mut Frame, app: &App, question: &Question, area: Rect) 
     let wrapped = paragraph.line_count(area.width.saturating_sub(2));
     let wrapped = u16::try_from(wrapped).unwrap_or(u16::MAX);
     let height = wrapped.saturating_add(2).min(area.height / 3).max(3);
-    let mut rows = button_rows(&question.body, area.width.saturating_sub(2));
+    let answered = app.answered_button(question.id);
+    let mut rows = button_rows(&question.body, area.width.saturating_sub(2), answered);
     rows.extend(link_rows(&question.body, area.width.saturating_sub(2)));
     let rows_height = match rows.len() {
         0 => 0,
@@ -189,9 +193,11 @@ fn draw_question(frame: &mut Frame, app: &App, question: &Question, area: Rect) 
     };
     frame.render_widget(content.block(pane), preview);
 
-    let block = Block::bordered()
-        .title(printable(&question.body.title()))
-        .border_style(ACCENT);
+    let mut title = Line::raw(printable(&question.body.title()));
+    if answered.is_some() {
+        title.push_span(Span::styled("  ✓ answered", ACCENT));
+    }
+    let block = Block::bordered().title(title).border_style(ACCENT);
     frame.render_widget(paragraph.block(block), asked);
 }
 
@@ -205,25 +211,32 @@ struct Row {
 }
 
 /// 選択肢を `[ 1 Yes ]` の形で並べ、幅に入るだけ 1 行に詰める。ボタンの途中では折り返さない
-fn button_rows(body: &QuestionBody, width: u16) -> Vec<Row> {
+fn button_rows(body: &QuestionBody, width: u16, answered: Option<usize>) -> Vec<Row> {
     let mut rows: Vec<Row> = Vec::new();
     for (i, option) in body.options().iter().enumerate() {
-        let button = Span::styled(format!("[ {} {} ]", i + 1, printable(option)), ACCENT);
+        let style = match answered {
+            None => Style::new().fg(ACCENT),
+            Some(pressed) if pressed == i => {
+                Style::new().fg(ACCENT).add_modifier(Modifier::REVERSED)
+            }
+            Some(_) => Style::new().fg(MUTED),
+        };
+        let button = Span::styled(format!("[ {} {} ]", i + 1, printable(option)), style);
         let size = u16::try_from(button.width()).unwrap_or(u16::MAX);
-        let target = Target::Button(i);
+        let target = answered.is_none().then_some(Target::Button(i));
         match rows.last_mut() {
             Some(row) if row.line.width() + 1 + button.width() <= usize::from(width) => {
                 let x = u16::try_from(row.line.width() + 1).unwrap_or(u16::MAX);
                 row.line.push_span(" ");
                 row.line.push_span(button);
                 row.buttons += 1;
-                row.targets.push((x, size, target));
+                row.targets.extend(target.map(|t| (x, size, t)));
             }
             _ => rows.push(Row {
                 line: Line::from(button),
                 buttons: 1,
                 links: 0,
-                targets: vec![(0, size, target)],
+                targets: target.map(|t| (0, size, t)).into_iter().collect(),
             }),
         }
     }
@@ -544,6 +557,47 @@ mod tests {
             *o = options.iter().map(|o| o.to_string()).collect();
         }
         q
+    }
+
+    #[test]
+    fn marks_the_answered_question_and_takes_no_more_presses() {
+        let mut app = App::default();
+        let question = with_options(&["Yes, merge", "No"]);
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        app.set_answered(question, 0, until);
+        app.set_questions(vec![]);
+        let rows = render(&app, Side::Right, 80, 16);
+        assert!(
+            rows.iter().any(|r| r.contains("┌Merge PR?  ✓ answered")),
+            "{}",
+            rows.join("\n")
+        );
+        let y = rows
+            .iter()
+            .position(|r| r.contains("[ 1 Yes, merge ] [ 2 No ]"))
+            .unwrap();
+        let x = rows[y].chars().position(|c| c == '[').unwrap();
+        let (x, y) = (u16::try_from(x).unwrap(), u16::try_from(y).unwrap());
+        assert_eq!(app.target_at(x, y), None);
+        let mut terminal = Terminal::new(TestBackend::new(80, 16)).unwrap();
+        terminal
+            .draw(|frame| draw(frame, &app, Side::Right))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let pressed = &buffer[(x, y)];
+        assert!(pressed.modifier.contains(Modifier::REVERSED));
+        assert_eq!(pressed.fg, ACCENT);
+        let other = rows[y as usize]
+            .chars()
+            .skip(usize::from(x) + 1)
+            .position(|c| c == '[')
+            .unwrap();
+        let other_x = x + 1 + u16::try_from(other).unwrap();
+        assert_eq!(app.target_at(other_x, y), None);
+        let other = &buffer[(other_x, y)];
+        assert!(!other.modifier.contains(Modifier::REVERSED));
+        assert_eq!(other.fg, MUTED);
+        assert_eq!(rows[15].trim_end(), " ↑↓ select  Enter attach  q quit");
     }
 
     #[test]
