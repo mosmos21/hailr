@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
 
+use hailr_core::mux::{AgentStatus, PaneInfo};
 use hailr_core::protocol::{
     ClientEvent, ClientId, MAX_LINKS, MAX_OPTIONS, Question, QuestionBody, QuestionId,
     WithdrawReason,
@@ -8,6 +9,7 @@ use hailr_core::protocol::{
 use tokio::sync::{mpsc, watch};
 
 pub mod http;
+pub mod poller;
 pub mod serve;
 pub mod socket;
 
@@ -24,11 +26,27 @@ struct State {
     questions: HashMap<QuestionId, Entry>,
     clients: HashMap<ClientId, Client>,
     next_connection: u64,
+    attaches: u64,
 }
 
 struct Entry {
     question: Question,
+    attach: Attach,
 }
+
+/// TUI から pane に attach したあと、pane が待ち（idle / blocked）を経て working になったら、人が pane で答えたとみなす
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Attach {
+    No,
+    /// attach したが、まだ待ちを見ていない。attach の前から別の作業で working のことがあるため。値は attach の通し番号
+    Marked(u64),
+    /// attach したあとに待ちを見た。次に working になったら答えたとみなす
+    Armed,
+}
+
+/// 一覧を取り始めた時点を表す。これより後の attach は、この一覧では進めない
+#[derive(Clone, Copy, Debug)]
+pub struct ListingStart(u64);
 
 struct Client {
     connection: u64,
@@ -127,7 +145,13 @@ impl Broker {
                 Registered::Updated
             }
             None => {
-                state.questions.insert(question.id, Entry { question });
+                state.questions.insert(
+                    question.id,
+                    Entry {
+                        question,
+                        attach: Attach::No,
+                    },
+                );
                 Registered::New
             }
         };
@@ -176,16 +200,55 @@ impl Broker {
 
     pub fn withdraw(&self, id: &QuestionId, reason: WithdrawReason) {
         let mut state = self.lock();
-        let Some(entry) = state.questions.remove(id) else {
-            return;
-        };
-        send(
-            &mut state,
-            entry.question.client_id,
-            ClientEvent::Withdrawn { id: *id, reason },
-        );
+        let withdrawn = withdraw(&mut state, id, reason);
         drop(state);
-        self.changed();
+        if withdrawn {
+            self.changed();
+        }
+    }
+
+    /// つなぎ直しで写しが作り直されると印も消えるので、TUI は attach から戻ったときにも呼び直す
+    pub fn mark_attached(&self, id: &QuestionId) {
+        let mut state = self.lock();
+        state.attaches += 1;
+        let seq = state.attaches;
+        if let Some(entry) = state.questions.get_mut(id) {
+            entry.attach = Attach::Marked(seq);
+        }
+    }
+
+    /// 一覧を取り始める直前に呼び、その一覧を渡す `reconcile_panes` に渡す
+    pub fn listing_start(&self) -> ListingStart {
+        ListingStart(self.lock().attaches)
+    }
+
+    /// attach して pane で答えた質問を取り下げる。pane が一覧に無いだけでは取り下げない。herdr の一覧は
+    /// agent の居る pane しか返さず、pane が閉じたときは ask-mcp の接続が切れてその質問が消えるため
+    pub fn reconcile_panes(&self, start: ListingStart, panes: &[PaneInfo]) {
+        let mut state = self.lock();
+        let mut answered = Vec::new();
+        for entry in state.questions.values_mut() {
+            let Some(pane) = panes.iter().find(|p| p.id == entry.question.pane_id) else {
+                continue;
+            };
+            let waiting = matches!(pane.status, AgentStatus::Idle | AgentStatus::Blocked);
+            match entry.attach {
+                // attach より前に取り始めた一覧は attach 前の様子なので、待ちに見えても進めない
+                Attach::Marked(seq) if waiting && seq <= start.0 => entry.attach = Attach::Armed,
+                Attach::Armed if pane.status == AgentStatus::Working => {
+                    answered.push(entry.question.id)
+                }
+                _ => {}
+            }
+        }
+        // 判定から取り下げまでの間に同じ質問が回答・再登録されないよう、同じロックの中で取り下げる
+        for id in &answered {
+            withdraw(&mut state, id, WithdrawReason::AnsweredInPane);
+        }
+        drop(state);
+        if !answered.is_empty() {
+            self.changed();
+        }
     }
 
     /// 全 client の送り手を手放す。SSE のストリームが終わり、ask-mcp の接続が閉じる
@@ -224,6 +287,16 @@ impl Broker {
     fn changed(&self) {
         self.changes.send_modify(|n| *n += 1);
     }
+}
+
+/// 質問を消して持ち主に知らせる。消したら true
+fn withdraw(state: &mut State, id: &QuestionId, reason: WithdrawReason) -> bool {
+    let Some(entry) = state.questions.remove(id) else {
+        return false;
+    };
+    let event = ClientEvent::Withdrawn { id: *id, reason };
+    send(state, entry.question.client_id, event);
+    true
 }
 
 /// 送れなかった client は切断として扱う。送り手を手放すと SSE が閉じ、ask-mcp がつなぎ直して再登録する
