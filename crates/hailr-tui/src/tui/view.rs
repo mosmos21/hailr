@@ -2,7 +2,7 @@ use hailr_core::protocol::{Question, QuestionBody};
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::Line;
+use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, List, ListState, Paragraph, Wrap};
 
 use super::app::App;
@@ -12,8 +12,6 @@ use crate::text::printable;
 const ACCENT: Color = Color::Cyan;
 const MUTED: Color = Color::DarkGray;
 const WARNING: Color = Color::Yellow;
-const KEYS: &str = " ↑↓ select  q quit";
-const KEYS_WHEN_EMPTY: &str = " q quit";
 
 /// 見た目の決めごとは DESIGN.md
 pub fn draw(frame: &mut Frame, app: &App, side: Side) {
@@ -40,12 +38,27 @@ pub fn draw(frame: &mut Frame, app: &App, side: Side) {
         Some(question) => draw_question(frame, app, question, main),
         None => draw_empty(frame, Block::bordered().border_style(MUTED), main),
     }
-    let keys = if app.questions().is_empty() {
-        KEYS_WHEN_EMPTY
-    } else {
-        KEYS
+    let footer_line = match app.notice() {
+        Some(notice) => Line::styled(format!(" {}", printable(notice)), WARNING),
+        None => Line::styled(keys(app), MUTED),
     };
-    frame.render_widget(Line::styled(keys, MUTED), footer);
+    frame.render_widget(footer_line, footer);
+}
+
+/// そのとき使えるキーだけを並べる
+fn keys(app: &App) -> String {
+    if app.selected().is_none() {
+        return " q quit".into();
+    }
+    if app.moved_on_its_own() {
+        return " ↑↓ select  q quit".into();
+    }
+    let answer = match app.shown_buttons() {
+        0 => String::new(),
+        1 => "  1 answer".into(),
+        n => format!("  1-{n} answer"),
+    };
+    format!(" ↑↓ select{answer}  d delete  q quit")
 }
 
 fn draw_list(frame: &mut Frame, app: &App, area: Rect) {
@@ -72,8 +85,50 @@ fn draw_question(frame: &mut Frame, app: &App, question: &Question, area: Rect) 
     let wrapped = paragraph.line_count(area.width.saturating_sub(2));
     let wrapped = u16::try_from(wrapped).unwrap_or(u16::MAX);
     let height = wrapped.saturating_add(2).min(area.height / 3).max(3);
-    let [preview, asked] =
-        Layout::vertical([Constraint::Fill(1), Constraint::Length(height)]).areas(area);
+    let rows = button_rows(&question.body, area.width.saturating_sub(2));
+    let rows_height = match rows.len() {
+        0 => 0,
+        n => u16::try_from(n)
+            .unwrap_or(u16::MAX)
+            .saturating_add(2)
+            .min(area.height / 3)
+            .max(3),
+    };
+    let [preview, asked, choices] = Layout::vertical([
+        Constraint::Fill(1),
+        Constraint::Length(height),
+        Constraint::Length(rows_height),
+    ])
+    .areas(area);
+    app.set_shown_buttons(0);
+    if !rows.is_empty() {
+        let mut block = Block::bordered().border_style(MUTED);
+        let inner = block.inner(choices);
+        // `[ 1 ` が入らない幅では番号が見えないため、1 つも見えていないとみなす
+        let visible = if inner.width < 4 {
+            0
+        } else {
+            usize::from(inner.height)
+        };
+        let mut rows = rows;
+        if rows.len() > visible && visible == 1 {
+            block = block.title(Line::styled("more hidden", WARNING));
+        }
+        // 隠れたボタンの番号では答えさせないため、見えている数を App に渡し、隠れていることも出す
+        if rows.len() > visible {
+            let keep = if visible >= 2 { visible - 1 } else { visible };
+            rows.truncate(keep);
+            if visible >= 2 {
+                rows.push((
+                    Line::styled("some buttons are hidden; make the window taller", WARNING),
+                    0,
+                ));
+            }
+        }
+        app.set_shown_buttons(rows.iter().map(|(_, count)| count).sum());
+        let lines: Vec<Line> = rows.into_iter().map(|(line, _)| line).collect();
+        frame.render_widget(Paragraph::new(lines).block(block), choices);
+    }
 
     let pane = Block::bordered()
         .title(printable(&question.pane_id.0))
@@ -98,6 +153,24 @@ fn draw_question(frame: &mut Frame, app: &App, question: &Question, area: Rect) 
         .title(printable(&question.body.title()))
         .border_style(ACCENT);
     frame.render_widget(paragraph.block(block), asked);
+}
+
+/// 選択肢を `[ 1 Yes ]` の形で並べ、幅に入るだけ 1 行に詰める。ボタンの途中では折り返さない
+/// 行ごとにボタンの数も返す
+fn button_rows(body: &QuestionBody, width: u16) -> Vec<(Line<'static>, usize)> {
+    let mut rows: Vec<(Line, usize)> = Vec::new();
+    for (i, option) in body.options().iter().enumerate() {
+        let button = Span::styled(format!("[ {} {} ]", i + 1, printable(option)), ACCENT);
+        match rows.last_mut() {
+            Some((row, count)) if row.width() + 1 + button.width() <= usize::from(width) => {
+                row.push_span(" ");
+                row.push_span(button);
+                *count += 1;
+            }
+            _ => rows.push((Line::from(button), 1)),
+        }
+    }
+    rows
 }
 
 fn body_text(body: &QuestionBody) -> String {
@@ -273,10 +346,149 @@ mod tests {
     #[test]
     fn draws_tiny_screens_without_panicking() {
         let mut app = App::default();
-        app.set_questions(vec![ask("w1:p1", "t", &"long ".repeat(2000))]);
-        for (width, height) in [(1, 1), (10, 3), (30, 5), (500, 2)] {
+        let mut buttons = ask("w1:p1", "t", &"long ".repeat(2000));
+        if let QuestionBody::Ask { options, .. } = &mut buttons.body {
+            *options = (1..=9)
+                .map(|n| format!("選択肢 {n} {}", "x".repeat(60)))
+                .collect();
+        }
+        app.set_questions(vec![buttons]);
+        for (width, height) in [(1, 1), (10, 3), (30, 5), (500, 2), (40, 12)] {
             render(&app, Side::Left, width, height);
             render(&App::default(), Side::Right, width, height);
+        }
+    }
+
+    fn with_options(options: &[&str]) -> Question {
+        let mut q = ask("w1:p1", "Merge PR?", "Ship it?");
+        if let QuestionBody::Ask { options: o, .. } = &mut q.body {
+            *o = options.iter().map(|o| o.to_string()).collect();
+        }
+        q
+    }
+
+    #[test]
+    fn shows_buttons_below_the_question_and_the_keys_to_press() {
+        let mut app = App::default();
+        app.set_questions(vec![with_options(&["Yes, merge", "No"])]);
+        let rows = render(&app, Side::Right, 80, 16);
+        let asked = rows.iter().position(|r| r.contains("┌Merge PR?")).unwrap();
+        let buttons = rows
+            .iter()
+            .position(|r| r.contains("[ 1 Yes, merge ] [ 2 No ]"))
+            .unwrap();
+        assert!(buttons > asked, "{}", rows.join("\n"));
+        assert_eq!(
+            rows[15].trim_end(),
+            " ↑↓ select  1-2 answer  d delete  q quit"
+        );
+
+        app.set_questions(vec![with_options(&["Yes"])]);
+        let rows = render(&app, Side::Right, 80, 16);
+        assert_eq!(
+            rows[15].trim_end(),
+            " ↑↓ select  q quit",
+            "moved on its own"
+        );
+
+        let mut app = App::default();
+        app.set_questions(vec![with_options(&["Yes"])]);
+        let rows = render(&app, Side::Right, 80, 16);
+        assert_eq!(
+            rows[15].trim_end(),
+            " ↑↓ select  1 answer  d delete  q quit"
+        );
+
+        let mut app = App::default();
+        app.set_questions(vec![with_options(&[])]);
+        let rows = render(&app, Side::Right, 80, 16);
+        let no_box = !rows.iter().any(|r| r.contains("[ 1"));
+        assert!(no_box, "no box without options");
+        assert_eq!(rows[15].trim_end(), " ↑↓ select  d delete  q quit");
+    }
+
+    #[test]
+    fn says_when_buttons_do_not_fit() {
+        let mut app = App::default();
+        let long: Vec<String> = (1..=9).map(|n| format!("{n}{}", "x".repeat(40))).collect();
+        let long: Vec<&str> = long.iter().map(String::as_str).collect();
+        app.set_questions(vec![with_options(&long)]);
+        let text = render(&app, Side::Right, 80, 16).join("\n");
+        assert!(text.contains("some buttons are hidden"), "{text}");
+        let rows = render(&app, Side::Right, 80, 16);
+        let shown = app.shown_buttons();
+        assert!(shown < 9, "{shown}");
+        assert!(
+            rows[15].contains(&format!("1-{shown} answer")),
+            "{}",
+            rows[15]
+        );
+        let text = render(&app, Side::Right, 80, 60).join("\n");
+        assert!(!text.contains("some buttons are hidden"), "{text}");
+        assert_eq!(app.shown_buttons(), 9);
+        assert!(text.contains("[ 9 9"), "{text}");
+    }
+
+    #[test]
+    fn wraps_buttons_that_do_not_fit_and_shows_permission_buttons() {
+        let mut app = App::default();
+        let long: Vec<String> = (1..=6).map(|n| format!("option number {n}")).collect();
+        let long: Vec<&str> = long.iter().map(String::as_str).collect();
+        app.set_questions(vec![with_options(&long)]);
+        let rows = render(&app, Side::Right, 80, 30);
+        for n in 1..=6 {
+            let button = format!("[ {n} option number {n} ]");
+            assert!(
+                rows.iter().any(|r| r.contains(&button)),
+                "{}",
+                rows.join("\n")
+            );
+        }
+
+        let mut permission = with_options(&[]);
+        permission.body = QuestionBody::Permission {
+            request_id: "abcde".into(),
+            tool_name: "Bash".into(),
+            description: "d".into(),
+            input_preview: "p".into(),
+        };
+        app.set_questions(vec![permission]);
+        let text = render(&app, Side::Right, 80, 16).join("\n");
+        assert!(text.contains("[ 1 Allow ] [ 2 Deny ]"), "{text}");
+    }
+
+    #[test]
+    fn a_notice_takes_the_place_of_the_keys() {
+        let mut app = App::default();
+        app.set_questions(vec![with_options(&["Yes"])]);
+        app.set_notice("the answer did not reach the session");
+        let rows = render(&app, Side::Right, 80, 12);
+        assert_eq!(rows[11].trim_end(), " the answer did not reach the session");
+    }
+
+    #[test]
+    fn counts_only_the_buttons_on_screen() {
+        let mut app = App::default();
+        let long: Vec<String> = (1..=9).map(|n| format!("{n}{}", "x".repeat(40))).collect();
+        let long: Vec<&str> = long.iter().map(String::as_str).collect();
+        app.set_questions(vec![with_options(&long)]);
+        for (width, height) in [(80, 16), (80, 10), (80, 60), (27, 30)] {
+            let text = render(&app, Side::Right, width, height).join("\n");
+            let shown = app.shown_buttons();
+            for n in 1..=shown {
+                assert!(
+                    text.contains(&format!("[ {n} ")),
+                    "{width}x{height}: {text}"
+                );
+            }
+            assert!(
+                !text.contains(&format!("[ {} ", shown + 1)),
+                "{width}x{height}: {text}"
+            );
+        }
+        for width in [10, 24, 26] {
+            render(&app, Side::Right, width, 30);
+            assert_eq!(app.shown_buttons(), 0, "width {width}");
         }
     }
 }
