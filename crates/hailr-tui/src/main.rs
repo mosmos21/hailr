@@ -9,7 +9,7 @@ use std::sync::Arc;
 use hailr_core::paths;
 use tokio::signal::unix::{SignalKind, signal};
 
-use broker::{Broker, poller, serve, socket};
+use broker::{Broker, notifier, poller, serve, socket};
 use config::Config;
 
 #[tokio::main(flavor = "current_thread")]
@@ -36,9 +36,16 @@ async fn main() -> ExitCode {
     eprintln!("hailr: listening on {}", path.display());
 
     let broker = Broker::new();
-    let polling = tokio::spawn(poller::run(Arc::clone(&broker), config.mux()));
+    let mux = config.mux();
+    let notifying = tokio::spawn(notifier::run(
+        Arc::clone(&broker),
+        broker.arrivals(),
+        Arc::clone(&mux),
+    ));
+    let polling = tokio::spawn(poller::run(Arc::clone(&broker), mux));
     let result = serve::run(listener, socket_file, broker, terminated()).await;
     polling.abort();
+    notifying.abort();
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
