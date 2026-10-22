@@ -60,10 +60,3 @@ Claude は `ask_human` ツールで質問を出したらターンを終え、TUI
 [ui]
 questions = "left"
 ```
-
-## 困ったとき
-
-- `ask_human` が `hailr is not running` を返す: TUI が起動していない。起動すれば次の質問から届く。TUI を再起動したときは、未回答の `ask_human` の質問を ask-mcp が出し直す。権限確認は出し直さないので、端末のダイアログで答える
-- `ask_human works only inside a herdr pane` が返る: Claude Code を herdr の pane の外で起動している
-- 回答を押しても Claude が動かない: Claude Code を `--dangerously-load-development-channels server:hailr` 付きで起動していない
-- TUI のログは `~/.local/state/hailr/hailr.log`。ask-mcp のログは Claude Code の MCP のログに出る
