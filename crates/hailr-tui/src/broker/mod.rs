@@ -16,6 +16,8 @@ pub mod socket;
 
 const CLIENT_QUEUE: usize = 16;
 const ARRIVALS: usize = 16;
+/// 打った返事の長さの上限（文字数）
+pub const MAX_REPLY: usize = 4000;
 // tokio の broadcast は容量を 2 のべき乗に切り上げるため、溢れる件数を ARRIVALS どおりにする
 const _: () = assert!(ARRIVALS.is_power_of_two());
 
@@ -82,6 +84,12 @@ pub enum AnswerError {
     NotFound,
     #[error("the answer is not one of the options")]
     NotAnOption,
+    #[error("a permission request takes only Allow or Deny")]
+    NotAQuestion,
+    #[error("the reply is empty")]
+    Empty,
+    #[error("the reply is longer than {MAX_REPLY} characters")]
+    TooLong,
     #[error("the asking client could not take the answer; it will reconnect and ask again")]
     Undelivered,
 }
@@ -185,15 +193,43 @@ impl Broker {
     }
 
     pub fn answer(&self, id: &QuestionId, answer: String) -> Result<(), AnswerError> {
+        self.deliver(id, answer, |question, answer| {
+            if question.body.options().contains(&answer) {
+                Ok(())
+            } else {
+                Err(AnswerError::NotAnOption)
+            }
+        })
+    }
+
+    /// ボタンの代わりに打った文で答える。権限確認は Allow / Deny でしか答えさせない
+    pub fn reply(&self, id: &QuestionId, text: String) -> Result<(), AnswerError> {
+        self.deliver(id, text, |question, text| {
+            if !matches!(question.body, QuestionBody::Ask { .. }) {
+                Err(AnswerError::NotAQuestion)
+            } else if text.trim().is_empty() {
+                Err(AnswerError::Empty)
+            } else if text.chars().count() > MAX_REPLY {
+                Err(AnswerError::TooLong)
+            } else {
+                Ok(())
+            }
+        })
+    }
+
+    fn deliver(
+        &self,
+        id: &QuestionId,
+        answer: String,
+        check: impl FnOnce(&Question, &str) -> Result<(), AnswerError>,
+    ) -> Result<(), AnswerError> {
         let mut state = self.lock();
         let question = &state
             .questions
             .get(id)
             .ok_or(AnswerError::NotFound)?
             .question;
-        if !question.body.options().contains(&answer.as_str()) {
-            return Err(AnswerError::NotAnOption);
-        }
+        check(question, &answer)?;
         let client = question.client_id;
         let delivered = send(
             &mut state,

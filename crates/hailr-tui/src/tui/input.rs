@@ -13,8 +13,47 @@ pub enum Action {
     Delete,
     Attach,
     Open,
+    Reply,
     Click(Target),
     Quit,
+}
+
+/// 返事を打っている間のキー
+#[derive(Debug, PartialEq, Eq)]
+pub enum Typing {
+    Text(String),
+    Erase,
+    Send,
+    Cancel,
+    Quit,
+}
+
+/// 打っている途中の数字や `q` を回答や終了にしないよう、文字は全部枠に入れる。貼り付けは 1 つの塊で受ける
+pub fn typing(event: &Event) -> Option<Typing> {
+    let (code, modifiers) = match event {
+        Event::Paste(text) => return Some(Typing::Text(text.clone())),
+        Event::Key(KeyEvent {
+            code,
+            modifiers,
+            kind: KeyEventKind::Press,
+            ..
+        }) => (code, modifiers),
+        _ => return None,
+    };
+    if modifiers.contains(KeyModifiers::CONTROL) {
+        return (*code == KeyCode::Char('c')).then_some(Typing::Quit);
+    }
+    match code {
+        KeyCode::Char(c) if !modifiers.contains(KeyModifiers::ALT) => {
+            Some(Typing::Text(c.to_string()))
+        }
+        KeyCode::Tab => Some(Typing::Text(" ".into())),
+        KeyCode::Backspace => Some(Typing::Erase),
+        // Option+Enter などで書きかけを送らないよう、修飾のない Enter だけで送る
+        KeyCode::Enter if modifiers.is_empty() => Some(Typing::Send),
+        KeyCode::Esc => Some(Typing::Cancel),
+        _ => None,
+    }
 }
 
 /// raw mode では Ctrl-C がシグナルにならずキーとして届くため、ここで終わりにする
@@ -37,6 +76,7 @@ pub fn action(event: &Event) -> Option<Action> {
         KeyCode::Char('d') if plain => Some(Action::Delete),
         KeyCode::Enter if plain => Some(Action::Attach),
         KeyCode::Char('o') if plain => Some(Action::Open),
+        KeyCode::Char('r') if plain => Some(Action::Reply),
         KeyCode::Char('q') => Some(Action::Quit),
         KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => Some(Action::Quit),
         _ => None,
@@ -143,5 +183,42 @@ mod tests {
         ] {
             assert_eq!(click(&mouse(kind, 4, 1), &app), None, "{kind:?}");
         }
+    }
+
+    #[test]
+    fn types_every_character_while_replying() {
+        let press = |code, modifiers| typing(&key(code, modifiers, KeyEventKind::Press));
+        let none = KeyModifiers::NONE;
+        for c in ['1', 'q', 'd', 'j', 'r', 'あ'] {
+            assert_eq!(
+                press(KeyCode::Char(c), none),
+                Some(Typing::Text(c.to_string()))
+            );
+        }
+        let shift = KeyModifiers::SHIFT;
+        assert_eq!(
+            press(KeyCode::Char('A'), shift),
+            Some(Typing::Text("A".into()))
+        );
+        assert_eq!(press(KeyCode::Enter, none), Some(Typing::Send));
+        for modifiers in [KeyModifiers::ALT, KeyModifiers::SHIFT] {
+            assert_eq!(press(KeyCode::Enter, modifiers), None);
+        }
+        assert_eq!(press(KeyCode::Tab, none), Some(Typing::Text(" ".into())));
+        assert_eq!(press(KeyCode::Esc, none), Some(Typing::Cancel));
+        assert_eq!(press(KeyCode::Backspace, none), Some(Typing::Erase));
+        let control = KeyModifiers::CONTROL;
+        assert_eq!(press(KeyCode::Char('c'), control), Some(Typing::Quit));
+        assert_eq!(press(KeyCode::Char('d'), control), None);
+        assert_eq!(press(KeyCode::Char('x'), KeyModifiers::ALT), None);
+        assert_eq!(press(KeyCode::Up, none), None);
+        let released = typing(&key(KeyCode::Char('1'), none, KeyEventKind::Release));
+        assert_eq!(released, None);
+        let pasted = typing(&Event::Paste("a\nb".into()));
+        assert_eq!(pasted, Some(Typing::Text("a\nb".into())));
+        assert_eq!(
+            action(&key(KeyCode::Char('r'), none, KeyEventKind::Press)),
+            Some(Action::Reply)
+        );
     }
 }

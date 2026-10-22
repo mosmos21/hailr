@@ -9,7 +9,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crossterm::event::EventStream;
+use crossterm::event::{Event, EventStream};
 use futures_util::StreamExt;
 use hailr_core::mux::Mux;
 use hailr_core::protocol::{PaneId, QuestionId, WithdrawReason};
@@ -19,8 +19,8 @@ use tokio::sync::{Notify, mpsc, watch};
 
 use crate::broker::Broker;
 use crate::config::Ui;
-use app::{App, Target};
-use input::Action;
+use app::{App, Choice, Target};
+use input::{Action, Typing};
 
 /// 押したボタンが効いたと見て取れるだけ、答えた質問を残す既定の長さ
 pub const ANSWERED_FOR: Duration = Duration::from_millis(1500);
@@ -33,13 +33,17 @@ pub async fn run(
     stop: impl Future<Output = ()>,
 ) -> io::Result<()> {
     let started = ratatui::try_init().and_then(|terminal| {
-        crossterm::execute!(io::stdout(), ReportClicks)?;
+        crossterm::execute!(
+            io::stdout(),
+            ReportClicks,
+            crossterm::event::EnableBracketedPaste
+        )?;
         Ok(terminal)
     });
     let mut terminal = match started {
         Ok(terminal) => terminal,
         Err(e) => {
-            release_mouse();
+            release_input();
             ratatui::restore();
             return Err(e);
         }
@@ -51,11 +55,11 @@ pub async fn run(
     std::panic::set_hook(Box::new(move |info| {
         on_panic.notify_one();
         // ratatui の restore はマウスの報告を止めないため、ここで止める
-        release_mouse();
+        release_input();
         previous_hook(info);
     }));
     let result = run_loop(&mut terminal, &broker, mux, ui, stop, &panicked).await;
-    release_mouse();
+    release_input();
     ratatui::restore();
     result
 }
@@ -70,8 +74,12 @@ impl crossterm::Command for ReportClicks {
 }
 
 /// 端末が閉じていれば書けないので失敗は無視する
-fn release_mouse() {
-    let _ = crossterm::execute!(io::stdout(), crossterm::event::DisableMouseCapture);
+fn release_input() {
+    let _ = crossterm::execute!(
+        io::stdout(),
+        crossterm::event::DisableMouseCapture,
+        crossterm::event::DisableBracketedPaste
+    );
 }
 
 async fn run_loop(
@@ -104,15 +112,15 @@ async fn run_loop(
             event = events.next() => match event {
                 None => return Ok(()),
                 Some(Err(e)) => return Err(e),
-                Some(Ok(event)) => match input::action(&event).or_else(|| input::click(&event, &app)) {
-                    Some(Action::Quit) => return Ok(()),
-                    Some(action) => match apply(&mut app, broker, action) {
-                        Some(Effect::Open(link)) => {
+                Some(Ok(event)) => match on_event(&mut app, broker, &event) {
+                    Step::Quit => return Ok(()),
+                    Step::Do(effect) => match effect {
+                        Effect::Open(link) => {
                             if let Err(e) = checked_url(&link).and_then(|url| open_link(&url)) {
                                 app.set_notice(format!("not opened: {e}"));
                             }
                         }
-                        Some(Effect::Attach(id, pane)) => {
+                        Effect::Attach(id, pane) => {
                             // crossterm の読み手が子に渡した端末の入力を横取りするため、渡す前に落とす
                             drop(events);
                             let attached = attach(terminal, &*mux, broker, &id, &pane, stop.as_mut(), panicked);
@@ -123,13 +131,8 @@ async fn run_loop(
                             events = EventStream::new();
                             back_from_attach(&mut app, broker, &id, handover);
                         }
-                        None => {}
                     },
-                    None if input::is_press(&event) => {
-                        app.clear_notice();
-                        app.end_opening();
-                    }
-                    None => {}
+                    Step::Nothing => {}
                 },
             },
             Ok(()) = changes.changed() => app.set_questions(broker.snapshot()),
@@ -182,6 +185,7 @@ fn apply(app: &mut App, broker: &Broker, action: Action) -> Option<Effect> {
             | Action::Delete
             | Action::Attach
             | Action::Open
+            | Action::Reply
             | Action::Click(Target::Button(_) | Target::Link(_))
     );
     if acts && app.selected().is_none() {
@@ -194,9 +198,13 @@ fn apply(app: &mut App, broker: &Broker, action: Action) -> Option<Effect> {
     }
     let settling = matches!(
         action,
-        Action::Answer(_) | Action::Delete | Action::Click(Target::Button(_))
+        Action::Answer(_) | Action::Delete | Action::Reply | Action::Click(Target::Button(_))
     );
-    if settling && app.selected_is_answered() {
+    // 返事は Enter で送るため、送った直後の押し直しを attach にしない
+    let replied = app
+        .selected()
+        .is_some_and(|q| matches!(app.answered_with(q.id), Some(Choice::Reply(_))));
+    if (settling && app.selected_is_answered()) || (action == Action::Attach && replied) {
         return None;
     }
     match action {
@@ -219,7 +227,11 @@ fn apply(app: &mut App, broker: &Broker, action: Action) -> Option<Effect> {
             let question = question.clone();
             let result = broker.answer(&question.id, answer);
             if result.is_ok() && !app.answered_for().is_zero() {
-                app.set_answered(question, button, Instant::now() + app.answered_for());
+                app.set_answered(
+                    question,
+                    Choice::Button(button),
+                    Instant::now() + app.answered_for(),
+                );
             }
             // 失敗しても broker は質問を消していることがある。押し直しが消えた質問に向かわないよう、すぐ取り直す
             app.set_questions(broker.snapshot());
@@ -238,6 +250,7 @@ fn apply(app: &mut App, broker: &Broker, action: Action) -> Option<Effect> {
                 .selected()
                 .map(|q| Effect::Attach(q.id, q.pane_id.clone()));
         }
+        Action::Reply => app.start_reply(),
         Action::Open => {
             if app.shown_links() > 0 {
                 app.start_opening();
@@ -246,6 +259,76 @@ fn apply(app: &mut App, broker: &Broker, action: Action) -> Option<Effect> {
         Action::Quit => {}
     }
     None
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum Step {
+    Quit,
+    Do(Effect),
+    Nothing,
+}
+
+/// 返事を打っている間はキーを全部文字として扱い、それ以外のときだけコマンドとして読む
+fn on_event(app: &mut App, broker: &Broker, event: &Event) -> Step {
+    if app.reply().is_some() {
+        return match input::typing(event) {
+            Some(Typing::Quit) => Step::Quit,
+            Some(typing) => {
+                app.clear_notice();
+                type_into(app, broker, typing);
+                Step::Nothing
+            }
+            None => Step::Nothing,
+        };
+    }
+    match input::action(event).or_else(|| input::click(event, app)) {
+        Some(Action::Quit) => Step::Quit,
+        Some(action) => apply(app, broker, action).map_or(Step::Nothing, Step::Do),
+        None if input::is_press(event) => {
+            app.clear_notice();
+            app.end_opening();
+            Step::Nothing
+        }
+        None => Step::Nothing,
+    }
+}
+
+fn type_into(app: &mut App, broker: &Broker, typing: Typing) {
+    match typing {
+        Typing::Text(text) => app.type_reply(&text),
+        Typing::Erase => app.erase_reply(),
+        Typing::Cancel => {
+            app.take_reply();
+        }
+        Typing::Send => send_reply(app, broker),
+        Typing::Quit => {}
+    }
+}
+
+/// 返事先が外れたあとの Enter は、打った文を黙って捨てないよう何もしない
+fn send_reply(app: &mut App, broker: &Broker) {
+    if app.reply_gone() {
+        return;
+    }
+    let Some((id, text)) = app.reply().map(|(id, text)| (id, text.trim().to_string())) else {
+        return;
+    };
+    if text.is_empty() {
+        return;
+    }
+    app.take_reply();
+    let question = app.questions().iter().find(|q| q.id == id).cloned();
+    let result = broker.reply(&id, text.clone());
+    if let (Ok(()), Some(question)) = (&result, question)
+        && !app.answered_for().is_zero()
+    {
+        let until = Instant::now() + app.answered_for();
+        app.set_answered(question, Choice::Reply(text), until);
+    }
+    app.set_questions(broker.snapshot());
+    if let Err(e) = result {
+        app.set_notice(format!("not sent: {e}"));
+    }
 }
 
 enum Handover {
@@ -352,6 +435,7 @@ fn leave(terminal: &mut DefaultTerminal) -> io::Result<()> {
     crossterm::execute!(
         io::stdout(),
         crossterm::event::DisableMouseCapture,
+        crossterm::event::DisableBracketedPaste,
         crossterm::terminal::LeaveAlternateScreen
     )
 }
@@ -362,7 +446,8 @@ fn enter(terminal: &mut DefaultTerminal) -> io::Result<()> {
         io::stdout(),
         crossterm::terminal::EnterAlternateScreen,
         crossterm::terminal::Clear(crossterm::terminal::ClearType::All),
-        ReportClicks
+        ReportClicks,
+        crossterm::event::EnableBracketedPaste
     )?;
     *terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
     Ok(())
@@ -454,6 +539,7 @@ impl Drop for AbortOnDrop {
 
 #[cfg(test)]
 mod tests {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use hailr_core::mux::{AgentStatus, PaneInfo};
     use hailr_core::protocol::{ClientEvent, ClientId, Question, QuestionBody};
     use uuid::Uuid;
@@ -511,7 +597,7 @@ mod tests {
         assert_eq!(events.try_recv().ok(), Some(answered));
         assert_eq!(broker.snapshot(), vec![second.clone()]);
         assert_eq!(app.selected().map(|q| q.id), Some(first.id));
-        assert_eq!(app.answered_button(first.id), Some(1));
+        assert_eq!(app.answered_with(first.id), Some(&Choice::Button(1)));
         assert!(!app.moved_on_its_own());
 
         for action in [
@@ -555,7 +641,7 @@ mod tests {
         assert!(events.try_recv().is_ok());
         broker.register(question.clone()).unwrap();
         app.set_questions(broker.snapshot());
-        assert_eq!(app.answered_button(question.id), None);
+        assert_eq!(app.answered_with(question.id), None);
         assert!(
             app.moved_on_its_own(),
             "a held key must not answer it again"
@@ -594,6 +680,144 @@ mod tests {
         assert_eq!(events.try_recv().ok(), Some(answered));
     }
 
+    fn press(code: KeyCode, modifiers: KeyModifiers) -> Event {
+        Event::Key(KeyEvent::new(code, modifiers))
+    }
+
+    fn char(c: char) -> Event {
+        press(KeyCode::Char(c), KeyModifiers::NONE)
+    }
+
+    fn enter() -> Event {
+        press(KeyCode::Enter, KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn sends_a_typed_reply_without_acting_on_its_keys() {
+        let broker = Broker::new();
+        let client = ClientId(Uuid::new_v4());
+        let (mut events, _guard) = broker.connect(client);
+        let question = ask(client, &["Yes"]);
+        broker.register(question.clone()).unwrap();
+        let mut app = App::default();
+        app.set_questions(broker.snapshot());
+        app.set_shown_buttons(9);
+
+        assert_eq!(on_event(&mut app, &broker, &char('r')), Step::Nothing);
+        on_event(&mut app, &broker, &Event::Paste("  ".into()));
+        on_event(&mut app, &broker, &enter());
+        assert_eq!(
+            app.reply().map(|r| r.1),
+            Some("  "),
+            "Enter on a blank reply keeps it open"
+        );
+        assert_eq!(app.notice(), None);
+        assert!(events.try_recv().is_err());
+        app.take_reply();
+        on_event(&mut app, &broker, &char('r'));
+        let keys = [
+            char('1'),
+            char('q'),
+            char('d'),
+            press(KeyCode::Char('d'), KeyModifiers::CONTROL),
+            press(KeyCode::Enter, KeyModifiers::ALT),
+            Event::Paste(" ok\n".into()),
+        ];
+        for key in &keys {
+            assert_eq!(on_event(&mut app, &broker, key), Step::Nothing);
+        }
+        assert!(events.try_recv().is_err(), "keys typed are not actions");
+        assert_eq!(broker.snapshot().len(), 1);
+        on_event(&mut app, &broker, &enter());
+        let answered = ClientEvent::Answered {
+            id: question.id,
+            answer: "1qd ok".into(),
+        };
+        assert_eq!(events.try_recv().ok(), Some(answered));
+        assert_eq!(app.reply(), None);
+        assert_eq!(
+            app.answered_with(question.id),
+            Some(&Choice::Reply("1qd ok".into()))
+        );
+        assert_eq!(
+            on_event(&mut app, &broker, &enter()),
+            Step::Nothing,
+            "a second Enter does not attach"
+        );
+        on_event(&mut app, &broker, &char('r'));
+        assert_eq!(app.reply(), None, "no second reply while it is kept");
+
+        on_event(&mut app, &broker, &char('k'));
+        wait_out(&mut app, &broker);
+        let quit = press(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        broker.register(ask(client, &["Yes"])).unwrap();
+        app.set_questions(broker.snapshot());
+        on_event(&mut app, &broker, &char('k'));
+        on_event(&mut app, &broker, &char('r'));
+        assert!(app.reply().is_some());
+        assert_eq!(on_event(&mut app, &broker, &quit), Step::Quit);
+    }
+
+    #[test]
+    fn keeps_the_keys_out_of_commands_after_the_question_goes_away() {
+        let broker = Broker::new();
+        let client = ClientId(Uuid::new_v4());
+        let (mut events, _guard) = broker.connect(client);
+        let first = ask(client, &["Yes"]);
+        let mut second = ask(client, &["Yes"]);
+        second.asked_at = 2;
+        let mut app = second_selected(&broker, &[first.clone(), second.clone()]);
+        apply(&mut app, &broker, Action::Previous);
+
+        on_event(&mut app, &broker, &char('r'));
+        on_event(&mut app, &broker, &char('x'));
+        broker.withdraw(&first.id, WithdrawReason::Deleted);
+        assert!(events.try_recv().is_ok());
+        app.set_questions(broker.snapshot());
+        assert!(app.reply_gone());
+        for key in [char('j'), char('d'), char('1'), char('q')] {
+            assert_eq!(on_event(&mut app, &broker, &key), Step::Nothing);
+        }
+        assert!(events.try_recv().is_err(), "nothing answered");
+        assert_eq!(broker.snapshot(), vec![second]);
+        broker.register(first.clone()).unwrap();
+        app.set_questions(broker.snapshot());
+        assert!(
+            app.reply_gone(),
+            "asked again, but another question is selected"
+        );
+        on_event(&mut app, &broker, &enter());
+        assert_eq!(app.reply().map(|r| r.1), Some("x"), "Enter keeps the text");
+        assert!(events.try_recv().is_err(), "nothing sent");
+        on_event(&mut app, &broker, &press(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(app.reply(), None, "Esc closes the box");
+        assert_eq!(app.notice(), None);
+    }
+
+    #[test]
+    fn cancels_a_reply_and_tells_when_it_cannot_be_sent() {
+        let broker = Broker::new();
+        let client = ClientId(Uuid::new_v4());
+        let (events, _guard) = broker.connect(client);
+        broker.register(ask(client, &["Yes"])).unwrap();
+        let mut app = App::default();
+        app.set_questions(broker.snapshot());
+
+        apply(&mut app, &broker, Action::Reply);
+        type_into(&mut app, &broker, Typing::Text("draft".into()));
+        type_into(&mut app, &broker, Typing::Cancel);
+        assert_eq!(app.reply(), None);
+        assert_eq!(broker.snapshot().len(), 1, "nothing sent");
+
+        drop(events);
+        apply(&mut app, &broker, Action::Reply);
+        type_into(&mut app, &broker, Typing::Text("late".into()));
+        type_into(&mut app, &broker, Typing::Send);
+        assert!(app.notice().unwrap().starts_with("not sent"));
+        assert_eq!(app.reply(), None);
+        assert!(app.selected().is_none(), "not kept as answered");
+    }
+
     #[test]
     fn keeps_nothing_when_the_delay_is_zero() {
         let broker = Broker::new();
@@ -605,6 +829,14 @@ mod tests {
         app.set_questions(broker.snapshot());
         app.set_shown_buttons(9);
         apply(&mut app, &broker, Action::Answer(0));
+        assert!(app.selected().is_none());
+
+        broker.register(ask(client, &["Yes"])).unwrap();
+        app.set_questions(broker.snapshot());
+        apply(&mut app, &broker, Action::Previous);
+        on_event(&mut app, &broker, &char('r'));
+        on_event(&mut app, &broker, &char('y'));
+        on_event(&mut app, &broker, &enter());
         assert!(app.selected().is_none());
     }
 
@@ -631,7 +863,7 @@ mod tests {
             Some(questions[2].id),
             "kept in its place"
         );
-        assert_eq!(app.answered_button(questions[2].id), None);
+        assert_eq!(app.answered_with(questions[2].id), None);
 
         apply(&mut app, &broker, Action::Answer(0));
         let answered = ClientEvent::Answered {
@@ -639,7 +871,7 @@ mod tests {
             answer: "Yes".into(),
         };
         assert_eq!(events.try_recv().ok(), Some(answered));
-        assert_eq!(app.answered_button(questions[1].id), None, "replaced");
+        assert_eq!(app.answered_with(questions[1].id), None, "replaced");
         assert!(!app.moved_on_its_own());
 
         app.select_next();
@@ -716,7 +948,12 @@ mod tests {
         apply(&mut app, &broker, Action::Answer(0));
         assert!(events.try_recv().is_ok());
         wait_out(&mut app, &broker);
-        for action in [Action::Answer(0), Action::Answer(0), Action::Delete] {
+        for action in [
+            Action::Answer(0),
+            Action::Answer(0),
+            Action::Delete,
+            Action::Reply,
+        ] {
             apply(&mut app, &broker, action);
             assert!(
                 events.try_recv().is_err(),

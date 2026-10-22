@@ -5,7 +5,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, List, ListState, Paragraph, Wrap};
 
-use super::app::{App, Target};
+use super::app::{App, Choice, Target};
 use crate::config::Side;
 use crate::text::printable;
 
@@ -41,6 +41,7 @@ pub fn draw(frame: &mut Frame, app: &App, side: Side) {
     }
     let footer_line = match app.notice() {
         Some(notice) => Line::styled(format!(" {}", printable(notice)), WARNING),
+        None if app.reply_gone() => Line::styled(" the question went away  Esc close", WARNING),
         None => Line::styled(keys(app), MUTED),
     };
     frame.render_widget(footer_line, footer);
@@ -48,6 +49,9 @@ pub fn draw(frame: &mut Frame, app: &App, side: Side) {
 
 /// そのとき使えるキーだけを並べる
 fn keys(app: &App) -> String {
+    if app.reply().is_some() {
+        return " Enter send  Esc cancel".into();
+    }
     if app.selected().is_none() {
         return " q quit".into();
     }
@@ -71,10 +75,22 @@ fn keys(app: &App) -> String {
     } else {
         ""
     };
-    if app.selected_is_answered() {
-        return format!(" ↑↓ select{open}  Enter attach  q quit");
+    if let Some(choice) = app.selected().and_then(|q| app.answered_with(q.id)) {
+        let attach = match choice {
+            Choice::Button(_) => "  Enter attach",
+            Choice::Reply(_) => "",
+        };
+        return format!(" ↑↓ select{open}{attach}  q quit");
     }
-    format!(" ↑↓ select{answer}{open}  Enter attach  d delete  q quit")
+    let reply = if app
+        .selected()
+        .is_some_and(|q| matches!(q.body, QuestionBody::Ask { .. }))
+    {
+        "  r reply"
+    } else {
+        ""
+    };
+    format!(" ↑↓ select{answer}{reply}{open}  Enter attach  d delete  q quit")
 }
 
 fn draw_list(frame: &mut Frame, app: &App, area: Rect) {
@@ -107,7 +123,15 @@ fn draw_question(frame: &mut Frame, app: &App, question: &Question, area: Rect) 
     let wrapped = paragraph.line_count(area.width.saturating_sub(2));
     let wrapped = u16::try_from(wrapped).unwrap_or(u16::MAX);
     let height = wrapped.saturating_add(2).min(area.height / 3).max(3);
-    let answered = app.answered_button(question.id);
+    let answered = app.answered_with(question.id);
+    let typing = app
+        .reply()
+        .filter(|(id, _)| *id == question.id)
+        .map(|(_, text)| text);
+    let sent = match answered {
+        Some(Choice::Reply(text)) => Some(text.as_str()),
+        _ => None,
+    };
     let mut rows = button_rows(&question.body, area.width.saturating_sub(2), answered);
     rows.extend(link_rows(&question.body, area.width.saturating_sub(2)));
     let rows_height = match rows.len() {
@@ -118,12 +142,21 @@ fn draw_question(frame: &mut Frame, app: &App, question: &Question, area: Rect) 
             .min(area.height / 3)
             .max(3),
     };
-    let [preview, asked, choices] = Layout::vertical([
+    let reply_height = if typing.is_some() || sent.is_some() {
+        3
+    } else {
+        0
+    };
+    let [preview, asked, choices, reply] = Layout::vertical([
         Constraint::Fill(1),
         Constraint::Length(height),
         Constraint::Length(rows_height),
+        Constraint::Length(reply_height),
     ])
     .areas(area);
+    if let Some(text) = typing.or(sent) {
+        draw_reply(frame, text, typing.is_some(), reply);
+    }
     app.set_shown_buttons(0);
     app.set_shown_links(0);
     if !rows.is_empty() {
@@ -211,12 +244,12 @@ struct Row {
 }
 
 /// 選択肢を `[ 1 Yes ]` の形で並べ、幅に入るだけ 1 行に詰める。ボタンの途中では折り返さない
-fn button_rows(body: &QuestionBody, width: u16, answered: Option<usize>) -> Vec<Row> {
+fn button_rows(body: &QuestionBody, width: u16, answered: Option<&Choice>) -> Vec<Row> {
     let mut rows: Vec<Row> = Vec::new();
     for (i, option) in body.options().iter().enumerate() {
         let style = match answered {
             None => Style::new().fg(ACCENT),
-            Some(pressed) if pressed == i => {
+            Some(&Choice::Button(pressed)) if pressed == i => {
                 Style::new().fg(ACCENT).add_modifier(Modifier::REVERSED)
             }
             Some(_) => Style::new().fg(MUTED),
@@ -241,6 +274,40 @@ fn button_rows(body: &QuestionBody, width: u16, answered: Option<usize>) -> Vec<
         }
     }
     rows
+}
+
+/// 打っている間は末尾が見えるよう左を落とし、IME の候補が末尾に出るよう端末のカーソルを置く
+fn draw_reply(frame: &mut Frame, text: &str, typing: bool, area: Rect) {
+    let color = if typing { ACCENT } else { MUTED };
+    let block = Block::bordered().title("Reply").border_style(color);
+    let inner = block.inner(area);
+    let room = usize::from(inner.width.saturating_sub(u16::from(typing)));
+    let text = printable(text);
+    let mut shown = String::new();
+    let mut width = 0;
+    for c in text.chars().rev() {
+        let w = Span::raw(c.to_string()).width();
+        if width + w > room {
+            break;
+        }
+        width += w;
+        shown.insert(0, c);
+    }
+    let style = if typing {
+        Style::new()
+    } else {
+        Style::new().fg(MUTED)
+    };
+    frame.render_widget(
+        Paragraph::new(Line::styled(shown, style)).block(block),
+        area,
+    );
+    if typing && inner.width > 0 && inner.height > 0 {
+        let x = inner
+            .x
+            .saturating_add(u16::try_from(width).unwrap_or(u16::MAX));
+        frame.set_cursor_position((x.min(inner.right().saturating_sub(1)), inner.y));
+    }
 }
 
 /// リンクは 1 行に 1 つ。ホストを出せないリンクとそれより後ろは開かせず、番号を控えめの色にする
@@ -564,7 +631,7 @@ mod tests {
         let mut app = App::default();
         let question = with_options(&["Yes, merge", "No"]);
         let until = std::time::Instant::now() + std::time::Duration::from_secs(60);
-        app.set_answered(question, 0, until);
+        app.set_answered(question, Choice::Button(0), until);
         app.set_questions(vec![]);
         let rows = render(&app, Side::Right, 80, 16);
         assert!(
@@ -601,6 +668,73 @@ mod tests {
     }
 
     #[test]
+    fn shows_the_reply_being_typed_with_the_cursor_at_its_end() {
+        let mut app = App::default();
+        app.set_questions(vec![with_options(&["Yes"])]);
+        app.start_reply();
+        app.type_reply("返事 ok");
+        let mut terminal = Terminal::new(TestBackend::new(80, 16)).unwrap();
+        terminal
+            .draw(|frame| draw(frame, &app, Side::Right))
+            .unwrap();
+        let rows = render(&app, Side::Right, 80, 16);
+        let y = rows.iter().position(|r| r.contains("┌Reply")).unwrap() + 1;
+        // 幅 2 の文字は 2 つ目のセルが空になる
+        assert!(rows[y].contains("返 事  ok"), "{}", rows.join("\n"));
+        assert_eq!(rows[15].trim_end(), " Enter send  Esc cancel");
+        let cursor = terminal.get_cursor_position().unwrap();
+        let x = rows[y].chars().position(|c| c == '返').unwrap();
+        assert_eq!(cursor.y, u16::try_from(y).unwrap());
+        assert_eq!(cursor.x, u16::try_from(x).unwrap() + 7, "after 返事 ok");
+
+        app.type_reply(&"x".repeat(200));
+        let rows = render(&app, Side::Right, 80, 16);
+        assert!(
+            rows[y].contains("xxxx │"),
+            "the end stays in view, with room for the cursor"
+        );
+    }
+
+    #[test]
+    fn shows_a_sent_reply_greyed() {
+        let mut app = App::default();
+        let question = with_options(&["Yes"]);
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        app.set_answered(question, Choice::Reply("later".into()), until);
+        app.set_questions(vec![]);
+        let mut terminal = Terminal::new(TestBackend::new(80, 16)).unwrap();
+        terminal
+            .draw(|frame| draw(frame, &app, Side::Right))
+            .unwrap();
+        let rows = render(&app, Side::Right, 80, 16);
+        let y = rows.iter().position(|r| r.contains("later")).unwrap();
+        let x = rows[y].chars().position(|c| c == 'l').unwrap();
+        let buffer = terminal.backend().buffer();
+        let (x, y) = (u16::try_from(x).unwrap(), u16::try_from(y).unwrap());
+        assert_eq!(buffer[(x, y)].fg, MUTED);
+        let button = rows.iter().position(|r| r.contains("[ 1 Yes ]")).unwrap();
+        let bx = rows[button].chars().position(|c| c == '[').unwrap();
+        let (bx, by) = (u16::try_from(bx).unwrap(), u16::try_from(button).unwrap());
+        assert_eq!(buffer[(bx, by)].fg, MUTED, "no button was pressed");
+        assert_eq!(
+            rows[15].trim_end(),
+            " ↑↓ select  q quit",
+            "Enter does not attach right after sending"
+        );
+    }
+
+    #[test]
+    fn tells_when_the_reply_has_nowhere_to_go() {
+        let mut app = App::default();
+        app.set_questions(vec![with_options(&["Yes"])]);
+        app.start_reply();
+        app.type_reply("half");
+        app.set_questions(vec![]);
+        let rows = render(&app, Side::Right, 80, 16);
+        assert_eq!(rows[15].trim_end(), " the question went away  Esc close");
+    }
+
+    #[test]
     fn shows_buttons_below_the_question_and_the_keys_to_press() {
         let mut app = App::default();
         app.set_questions(vec![with_options(&["Yes, merge", "No"])]);
@@ -613,7 +747,7 @@ mod tests {
         assert!(buttons > asked, "{}", rows.join("\n"));
         assert_eq!(
             rows[15].trim_end(),
-            " ↑↓ select  1-2 answer  Enter attach  d delete  q quit"
+            " ↑↓ select  1-2 answer  r reply  Enter attach  d delete  q quit"
         );
 
         app.set_questions(vec![with_options(&["Yes"])]);
@@ -629,7 +763,7 @@ mod tests {
         let rows = render(&app, Side::Right, 80, 16);
         assert_eq!(
             rows[15].trim_end(),
-            " ↑↓ select  1 answer  Enter attach  d delete  q quit"
+            " ↑↓ select  1 answer  r reply  Enter attach  d delete  q quit"
         );
 
         let mut app = App::default();
@@ -639,7 +773,7 @@ mod tests {
         assert!(no_box, "no box without options");
         assert_eq!(
             rows[15].trim_end(),
-            " ↑↓ select  Enter attach  d delete  q quit"
+            " ↑↓ select  r reply  Enter attach  d delete  q quit"
         );
     }
 
@@ -688,9 +822,16 @@ mod tests {
             description: "d".into(),
             input_preview: "p".into(),
         };
+        let mut app = App::default();
         app.set_questions(vec![permission]);
-        let text = render(&app, Side::Right, 80, 16).join("\n");
+        let rows = render(&app, Side::Right, 80, 16);
+        let text = rows.join("\n");
         assert!(text.contains("[ 1 Allow ] [ 2 Deny ]"), "{text}");
+        assert_eq!(
+            rows[15].trim_end(),
+            " ↑↓ select  1-2 answer  Enter attach  d delete  q quit",
+            "no reply to a permission request"
+        );
     }
 
     #[test]
@@ -808,7 +949,7 @@ mod tests {
         assert_eq!(app.shown_links(), 2);
         assert_eq!(
             rows[29].trim_end(),
-            " ↑↓ select  1-2 answer  o open  Enter attach  d delete  q quit"
+            " ↑↓ select  1-2 answer  r reply  o open  Enter attach  d delete  q quit"
         );
 
         app.start_opening();
