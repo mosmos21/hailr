@@ -67,3 +67,10 @@ questions = "left"
 [notify]
 toast = true
 ```
+
+ボタンで答えた質問は 1.5 秒残る。長さは秒で変えられ（1 時間まで）、0 ならすぐ消える。
+
+```toml
+[ui]
+answered_delay = 0.5
+```

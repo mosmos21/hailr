@@ -7,6 +7,7 @@ use std::future::Future;
 use std::io;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use crossterm::event::EventStream;
 use futures_util::StreamExt;
@@ -17,15 +18,18 @@ use ratatui::{DefaultTerminal, Terminal};
 use tokio::sync::{Notify, mpsc, watch};
 
 use crate::broker::Broker;
-use crate::config::Side;
+use crate::config::Ui;
 use app::{App, Target};
 use input::Action;
+
+/// 押したボタンが効いたと見て取れるだけ、答えた質問を残す既定の長さ
+pub const ANSWERED_FOR: Duration = Duration::from_millis(1500);
 
 /// 端末を代替画面に切り替えて質問を出す。q / Ctrl-C、`stop`、入力が閉じたときに戻して終わる
 pub async fn run(
     broker: Arc<Broker>,
     mux: Arc<dyn Mux>,
-    side: Side,
+    ui: Ui,
     stop: impl Future<Output = ()>,
 ) -> io::Result<()> {
     let started = ratatui::try_init().and_then(|terminal| {
@@ -50,7 +54,7 @@ pub async fn run(
         release_mouse();
         previous_hook(info);
     }));
-    let result = run_loop(&mut terminal, &broker, mux, side, stop, &panicked).await;
+    let result = run_loop(&mut terminal, &broker, mux, ui, stop, &panicked).await;
     release_mouse();
     ratatui::restore();
     result
@@ -74,12 +78,13 @@ async fn run_loop(
     terminal: &mut DefaultTerminal,
     broker: &Broker,
     mux: Arc<dyn Mux>,
-    side: Side,
+    ui: Ui,
     stop: impl Future<Output = ()>,
     panicked: &Notify,
 ) -> io::Result<()> {
     let mut changes = broker.changes();
     let mut app = App::default();
+    app.set_answered_for(ui.answered_delay);
     app.set_questions(broker.snapshot());
     let (pane_tx, pane_rx) = watch::channel(app.selected_pane());
     let (shot_tx, mut shots) = mpsc::channel(1);
@@ -89,7 +94,8 @@ async fn run_loop(
     tokio::pin!(stop);
 
     loop {
-        terminal.draw(|frame| view::draw(frame, &app, side))?;
+        terminal.draw(|frame| view::draw(frame, &app, ui.questions))?;
+        let answered_until = app.answered_until();
         // panic で端末が戻ったあとに 1 フレームも描かないよう、panic を先に見る
         tokio::select! {
             biased;
@@ -127,6 +133,9 @@ async fn run_loop(
                 },
             },
             Ok(()) = changes.changed() => app.set_questions(broker.snapshot()),
+            () = tokio::time::sleep_until(answered_until.unwrap_or_else(Instant::now).into()), if answered_until.is_some() => {
+                app.expire_answered(Instant::now(), broker.snapshot());
+            }
             Some(shot) = shots.recv() => app.set_shot(shot),
         }
         let repointed = pane_tx.send_if_modified(|pane| {
@@ -183,6 +192,13 @@ fn apply(app: &mut App, broker: &Broker, action: Action) -> Option<Effect> {
         app.set_notice("the selection moved; press ↑ or ↓ to pick a question first");
         return None;
     }
+    let settling = matches!(
+        action,
+        Action::Answer(_) | Action::Delete | Action::Click(Target::Button(_))
+    );
+    if settling && app.selected_is_answered() {
+        return None;
+    }
     match action {
         Action::Previous => app.select_previous(),
         Action::Next => app.select_next(),
@@ -200,7 +216,11 @@ fn apply(app: &mut App, broker: &Broker, action: Action) -> Option<Effect> {
                 return None;
             }
             let answer = question.body.options().get(button)?.to_string();
+            let question = question.clone();
             let result = broker.answer(&question.id, answer);
+            if result.is_ok() && !app.answered_for().is_zero() {
+                app.set_answered(question, button, Instant::now() + app.answered_for());
+            }
             // 失敗しても broker は質問を消していることがある。押し直しが消えた質問に向かわないよう、すぐ取り直す
             app.set_questions(broker.snapshot());
             if let Err(e) = result {
@@ -455,6 +475,11 @@ mod tests {
         }
     }
 
+    /// 答えた質問を残す時間が過ぎたあとの一覧にする
+    fn wait_out(app: &mut App, broker: &Broker) {
+        app.expire_answered(Instant::now() + ANSWERED_FOR, broker.snapshot());
+    }
+
     /// 質問を並べて登録し、2 件目を選んだ状態にする
     fn second_selected(broker: &Broker, questions: &[Question]) -> App {
         for q in questions {
@@ -465,6 +490,167 @@ mod tests {
         app.set_shown_buttons(9);
         apply(&mut app, broker, Action::Next);
         app
+    }
+
+    #[test]
+    fn keeps_an_answered_question_until_its_time_is_up() {
+        let broker = Broker::new();
+        let client = ClientId(Uuid::new_v4());
+        let (mut events, _guard) = broker.connect(client);
+        let first = ask(client, &["Yes", "No"]);
+        let mut second = ask(client, &["Yes"]);
+        second.asked_at = 2;
+        let mut app = second_selected(&broker, &[first.clone(), second.clone()]);
+        apply(&mut app, &broker, Action::Previous);
+
+        apply(&mut app, &broker, Action::Answer(1));
+        let answered = ClientEvent::Answered {
+            id: first.id,
+            answer: "No".into(),
+        };
+        assert_eq!(events.try_recv().ok(), Some(answered));
+        assert_eq!(broker.snapshot(), vec![second.clone()]);
+        assert_eq!(app.selected().map(|q| q.id), Some(first.id));
+        assert_eq!(app.answered_button(first.id), Some(1));
+        assert!(!app.moved_on_its_own());
+
+        for action in [
+            Action::Delete,
+            Action::Click(Target::Button(0)),
+            Action::Answer(0),
+        ] {
+            apply(&mut app, &broker, action);
+        }
+        assert!(events.try_recv().is_err(), "pressed again");
+        assert_eq!(
+            app.notice(),
+            None,
+            "no warning for a press that does nothing"
+        );
+        assert_eq!(broker.snapshot(), vec![second.clone()]);
+        app.expire_answered(Instant::now(), broker.snapshot());
+        assert_eq!(
+            app.selected().map(|q| q.id),
+            Some(first.id),
+            "gone too early"
+        );
+
+        wait_out(&mut app, &broker);
+        assert_eq!(app.selected().map(|q| q.id), Some(second.id));
+        assert!(app.moved_on_its_own());
+    }
+
+    #[test]
+    fn treats_a_question_asked_again_as_new() {
+        let broker = Broker::new();
+        let client = ClientId(Uuid::new_v4());
+        let (mut events, _guard) = broker.connect(client);
+        let question = ask(client, &["Yes"]);
+        broker.register(question.clone()).unwrap();
+        let mut app = App::default();
+        app.set_questions(broker.snapshot());
+        app.set_shown_buttons(9);
+
+        apply(&mut app, &broker, Action::Answer(0));
+        assert!(events.try_recv().is_ok());
+        broker.register(question.clone()).unwrap();
+        app.set_questions(broker.snapshot());
+        assert_eq!(app.answered_button(question.id), None);
+        assert!(
+            app.moved_on_its_own(),
+            "a held key must not answer it again"
+        );
+        apply(&mut app, &broker, Action::Answer(0));
+        assert!(events.try_recv().is_err());
+
+        apply(&mut app, &broker, Action::Previous);
+        apply(&mut app, &broker, Action::Answer(0));
+        assert!(events.try_recv().is_ok());
+    }
+
+    #[test]
+    fn leaves_another_choice_alone_when_an_answered_question_comes_back() {
+        let broker = Broker::new();
+        let client = ClientId(Uuid::new_v4());
+        let (mut events, _guard) = broker.connect(client);
+        let first = ask(client, &["Yes"]);
+        let mut second = ask(client, &["Yes"]);
+        second.asked_at = 2;
+        let mut app = second_selected(&broker, &[first.clone(), second.clone()]);
+        apply(&mut app, &broker, Action::Previous);
+
+        apply(&mut app, &broker, Action::Answer(0));
+        assert!(events.try_recv().is_ok());
+        apply(&mut app, &broker, Action::Next);
+        broker.register(first.clone()).unwrap();
+        app.set_questions(broker.snapshot());
+        assert!(!app.moved_on_its_own());
+        assert_eq!(app.selected().map(|q| q.id), Some(second.id));
+        apply(&mut app, &broker, Action::Answer(0));
+        let answered = ClientEvent::Answered {
+            id: second.id,
+            answer: "Yes".into(),
+        };
+        assert_eq!(events.try_recv().ok(), Some(answered));
+    }
+
+    #[test]
+    fn keeps_nothing_when_the_delay_is_zero() {
+        let broker = Broker::new();
+        let client = ClientId(Uuid::new_v4());
+        let (_events, _guard) = broker.connect(client);
+        broker.register(ask(client, &["Yes"])).unwrap();
+        let mut app = App::default();
+        app.set_answered_for(Duration::ZERO);
+        app.set_questions(broker.snapshot());
+        app.set_shown_buttons(9);
+        apply(&mut app, &broker, Action::Answer(0));
+        assert!(app.selected().is_none());
+    }
+
+    #[test]
+    fn lets_another_question_be_answered_while_one_is_kept() {
+        let broker = Broker::new();
+        let client = ClientId(Uuid::new_v4());
+        let (mut events, _guard) = broker.connect(client);
+        let mut questions: Vec<_> = (1..=3).map(|_| ask(client, &["Yes"])).collect();
+        for (at, q) in (1..).zip(questions.iter_mut()) {
+            q.asked_at = at;
+        }
+        let mut app = second_selected(&broker, &questions);
+
+        apply(&mut app, &broker, Action::Answer(0));
+        assert!(events.try_recv().is_ok());
+        let mut late = ask(client, &["Yes"]);
+        late.asked_at = 4;
+        broker.register(late.clone()).unwrap();
+        app.set_questions(broker.snapshot());
+        app.select_next();
+        assert_eq!(
+            app.selected().map(|q| q.id),
+            Some(questions[2].id),
+            "kept in its place"
+        );
+        assert_eq!(app.answered_button(questions[2].id), None);
+
+        apply(&mut app, &broker, Action::Answer(0));
+        let answered = ClientEvent::Answered {
+            id: questions[2].id,
+            answer: "Yes".into(),
+        };
+        assert_eq!(events.try_recv().ok(), Some(answered));
+        assert_eq!(app.answered_button(questions[1].id), None, "replaced");
+        assert!(!app.moved_on_its_own());
+
+        app.select_next();
+        assert_eq!(app.selected().map(|q| q.id), Some(late.id));
+        wait_out(&mut app, &broker);
+        assert_eq!(
+            app.selected().map(|q| q.id),
+            Some(late.id),
+            "a choice stays"
+        );
+        assert!(!app.moved_on_its_own());
     }
 
     #[test]
@@ -529,6 +715,7 @@ mod tests {
 
         apply(&mut app, &broker, Action::Answer(0));
         assert!(events.try_recv().is_ok());
+        wait_out(&mut app, &broker);
         for action in [Action::Answer(0), Action::Answer(0), Action::Delete] {
             apply(&mut app, &broker, action);
             assert!(
@@ -555,6 +742,7 @@ mod tests {
 
         apply(&mut app, &broker, Action::Answer(0));
         assert!(app.notice().unwrap().contains("ask again"));
+        assert!(app.selected().is_none(), "not kept as answered");
         apply(&mut app, &broker, Action::Next);
         assert!(app.notice().is_none());
     }
@@ -581,6 +769,7 @@ mod tests {
 
         apply(&mut app, &broker, Action::Previous);
         apply(&mut app, &broker, Action::Answer(0));
+        wait_out(&mut app, &broker);
         assert_eq!(apply(&mut app, &broker, Action::Attach), None, "moved");
         assert!(app.notice().unwrap().contains("pick a question first"));
     }
@@ -902,6 +1091,7 @@ mod tests {
         };
         assert_eq!(events.try_recv().unwrap(), answered, "and answers");
 
+        wait_out(&mut app, &broker);
         assert!(app.moved_on_its_own());
         apply(&mut app, &broker, click(Target::Button(0)));
         assert!(events.try_recv().is_err(), "not after the selection moved");

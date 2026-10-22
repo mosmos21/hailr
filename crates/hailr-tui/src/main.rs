@@ -62,7 +62,7 @@ async fn main() -> ExitCode {
 
     // broker が先に止まったら、質問が届かない画面を出し続けないよう TUI も閉じる
     let mut served = None;
-    let shown = tui::run(broker, mux, config.ui.questions, async {
+    let shown = tui::run(broker, mux, config.ui, async {
         tokio::select! {
             () = terminated() => {}
             result = &mut serving => served = Some(result),

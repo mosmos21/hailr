@@ -1,4 +1,5 @@
 use std::cell::{Cell, RefCell};
+use std::time::Instant;
 
 use hailr_core::protocol::{PaneId, Question, QuestionId};
 use ratatui::layout::{Position, Rect};
@@ -35,12 +36,41 @@ pub struct App {
     shown_links: Cell<usize>,
     /// 直前の描画でクリックできた場所
     targets: RefCell<Vec<(Rect, Target)>>,
+    answered: Option<Answered>,
+    answered_for: Option<std::time::Duration>,
+}
+
+/// 押したボタンが効いたと分かるよう、答えた質問を期限まで一覧に残す
+struct Answered {
+    question: Question,
+    button: usize,
+    until: Instant,
 }
 
 impl App {
     /// 選んでいた質問が消えたら、同じ位置（無ければ最後）の質問に移る
-    pub fn set_questions(&mut self, questions: Vec<Question>) {
+    pub fn set_questions(&mut self, mut questions: Vec<Question>) {
         let position = self.selected_index().unwrap_or(0);
+        // 同じ質問が聞き直されたら、もう答えたものとして見せない
+        if let Some(answered) = &self.answered
+            && questions.iter().any(|q| q.id == answered.question.id)
+        {
+            // 押した数字のキーリピートが聞き直された質問に届かないよう、選び直すまで答えさせない
+            if self.selected == Some(answered.question.id) {
+                self.moved = true;
+            }
+            self.answered = None;
+        }
+        if let Some(answered) = &self.answered
+            && !questions.iter().any(|q| q.id == answered.question.id)
+        {
+            let key = (answered.question.asked_at, answered.question.id);
+            let at = questions
+                .iter()
+                .position(|q| (q.asked_at, q.id) > key)
+                .unwrap_or(questions.len());
+            questions.insert(at, answered.question.clone());
+        }
         self.questions = questions;
         if self.selected_index().is_none() {
             let last = self.questions.len().checked_sub(1);
@@ -106,6 +136,47 @@ impl App {
     pub fn shot(&self) -> Option<&Result<Text<'static>, String>> {
         let (pane, result) = self.shot.as_ref()?;
         (Some(pane) == self.selected().map(|q| &q.pane_id)).then_some(result)
+    }
+
+    pub fn set_answered_for(&mut self, delay: std::time::Duration) {
+        self.answered_for = Some(delay);
+    }
+
+    pub fn answered_for(&self) -> std::time::Duration {
+        self.answered_for.unwrap_or(super::ANSWERED_FOR)
+    }
+
+    pub fn set_answered(&mut self, question: Question, button: usize, until: Instant) {
+        self.answered = Some(Answered {
+            question,
+            button,
+            until,
+        });
+    }
+
+    /// 答えたばかりで残している質問なら、押したボタンの位置
+    pub fn answered_button(&self, id: QuestionId) -> Option<usize> {
+        self.answered
+            .as_ref()
+            .filter(|a| a.question.id == id)
+            .map(|a| a.button)
+    }
+
+    pub fn answered_until(&self) -> Option<Instant> {
+        self.answered.as_ref().map(|a| a.until)
+    }
+
+    /// 期限が来ていれば手放し、一覧を取り直す
+    pub fn expire_answered(&mut self, now: Instant, questions: Vec<Question>) {
+        if self.answered_until().is_some_and(|until| until <= now) {
+            self.answered = None;
+        }
+        self.set_questions(questions);
+    }
+
+    pub fn selected_is_answered(&self) -> bool {
+        self.selected()
+            .is_some_and(|q| self.answered_button(q.id).is_some())
     }
 
     /// 一覧が変わって選択が移ったまま、人がまだ選び直していない
