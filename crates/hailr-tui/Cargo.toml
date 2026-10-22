@@ -4,6 +4,16 @@ version.workspace = true
 edition.workspace = true
 repository.workspace = true
 
+[[bin]]
+name = "hailr"
+path = "src/main.rs"
+
 [dependencies]
 hailr-core.workspace = true
 hailr-herdr.workspace = true
+thiserror = "2"
+tokio = { version = "1.54", features = ["sync"] }
+url = "2"
+
+[dev-dependencies]
+uuid = { version = "1.28", features = ["v4"] }
