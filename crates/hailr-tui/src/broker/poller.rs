@@ -69,6 +69,9 @@ mod tests {
         fn attach_command(&self, _: &PaneId) -> Result<Command, MuxError> {
             unimplemented!()
         }
+        fn focus(&self, _: &PaneId) -> Result<(), MuxError> {
+            unimplemented!()
+        }
         fn notify(&self, _: &str, _: &str) -> Result<(), MuxError> {
             unimplemented!()
         }

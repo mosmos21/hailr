@@ -96,6 +96,7 @@ async fn run_loop(
     app.set_questions(broker.snapshot());
     let (pane_tx, pane_rx) = watch::channel(app.selected_pane());
     let (shot_tx, mut shots) = mpsc::channel(1);
+    let (focus_tx, mut not_focused) = mpsc::unbounded_channel();
     let previewing = tokio::spawn(preview::run(Arc::clone(&mux), pane_rx, shot_tx));
     let _stop_previewing = AbortOnDrop(previewing);
     let mut events = EventStream::new();
@@ -120,6 +121,15 @@ async fn run_loop(
                                 app.set_notice(format!("not opened: {e}"));
                             }
                         }
+                        Effect::Focus(pane) => {
+                            // herdr を待つ間も broker と描画を止めないよう、別のスレッドで呼んで結果だけ受け取る
+                            let (mux, tx) = (Arc::clone(&mux), focus_tx.clone());
+                            tokio::task::spawn_blocking(move || {
+                                if let Err(e) = mux.focus(&pane) {
+                                    let _ = tx.send(format!("not focused on {}: {e}", pane.0));
+                                }
+                            });
+                        }
                         Effect::Attach(id, pane) => {
                             // crossterm の読み手が子に渡した端末の入力を横取りするため、渡す前に落とす
                             drop(events);
@@ -140,6 +150,12 @@ async fn run_loop(
                 app.expire_answered(Instant::now(), broker.snapshot());
             }
             Some(shot) = shots.recv() => app.set_shot(shot),
+            Some(e) = not_focused.recv() => {
+                // 遅れて届いた失敗で、あとから出た知らせを消さない
+                if app.notice().is_none() {
+                    app.set_notice(e);
+                }
+            }
         }
         let repointed = pane_tx.send_if_modified(|pane| {
             let selected = app.selected_pane();
@@ -157,6 +173,7 @@ async fn run_loop(
 #[derive(Debug, PartialEq, Eq)]
 enum Effect {
     Attach(QuestionId, PaneId),
+    Focus(PaneId),
     Open(String),
 }
 
@@ -184,6 +201,7 @@ fn apply(app: &mut App, broker: &Broker, action: Action) -> Option<Effect> {
         Action::Answer(_)
             | Action::Delete
             | Action::Attach
+            | Action::Focus
             | Action::Open
             | Action::Reply
             | Action::Click(Target::Button(_) | Target::Link(_))
@@ -250,6 +268,7 @@ fn apply(app: &mut App, broker: &Broker, action: Action) -> Option<Effect> {
                 .selected()
                 .map(|q| Effect::Attach(q.id, q.pane_id.clone()));
         }
+        Action::Focus => return app.selected_pane().map(Effect::Focus),
         Action::Reply => app.start_reply(),
         Action::Open => {
             if app.shown_links() > 0 {
@@ -719,6 +738,7 @@ mod tests {
             char('1'),
             char('q'),
             char('d'),
+            char('f'),
             press(KeyCode::Char('d'), KeyModifiers::CONTROL),
             press(KeyCode::Enter, KeyModifiers::ALT),
             Event::Paste(" ok\n".into()),
@@ -731,13 +751,13 @@ mod tests {
         on_event(&mut app, &broker, &enter());
         let answered = ClientEvent::Answered {
             id: question.id,
-            answer: "1qd ok".into(),
+            answer: "1qdf ok".into(),
         };
         assert_eq!(events.try_recv().ok(), Some(answered));
         assert_eq!(app.reply(), None);
         assert_eq!(
             app.answered_with(question.id),
-            Some(&Choice::Reply("1qd ok".into()))
+            Some(&Choice::Reply("1qdf ok".into()))
         );
         assert_eq!(
             on_event(&mut app, &broker, &enter()),
@@ -789,7 +809,7 @@ mod tests {
         assert!(events.try_recv().is_ok());
         app.set_questions(broker.snapshot());
         assert!(app.reply_gone());
-        for key in [char('j'), char('d'), char('1'), char('q')]
+        for key in [char('j'), char('d'), char('1'), char('q'), char('f')]
             .iter()
             .chain(&ignored)
         {
@@ -1000,6 +1020,33 @@ mod tests {
         assert!(app.selected().is_none(), "not kept as answered");
         apply(&mut app, &broker, Action::Next);
         assert!(app.notice().is_none());
+    }
+
+    #[test]
+    fn focuses_the_selected_pane_even_just_after_answering() {
+        let broker = Broker::new();
+        let client = ClientId(Uuid::new_v4());
+        let (_events, _guard) = broker.connect(client);
+        let mut app = App::default();
+        assert_eq!(
+            apply(&mut app, &broker, Action::Focus),
+            None,
+            "no questions"
+        );
+
+        let first = ask(client, &["Yes"]);
+        let mut next = ask(client, &["Yes"]);
+        next.asked_at = 2;
+        next.pane_id = PaneId("w1:p2".into());
+        let mut app = second_selected(&broker, &[first.clone(), next.clone()]);
+        let target = Some(Effect::Focus(next.pane_id.clone()));
+        assert_eq!(apply(&mut app, &broker, Action::Focus), target);
+        apply(&mut app, &broker, Action::Answer(0));
+        assert_eq!(apply(&mut app, &broker, Action::Focus), target, "answered");
+
+        wait_out(&mut app, &broker);
+        assert_eq!(apply(&mut app, &broker, Action::Focus), None, "moved");
+        assert!(app.notice().unwrap().contains("pick a question first"));
     }
 
     #[test]
@@ -1252,6 +1299,9 @@ mod tests {
         apply(&mut app, &broker, Action::Open);
         assert_eq!(apply(&mut app, &broker, Action::Delete), None);
         assert_eq!(broker.snapshot().len(), 1, "d only cancels");
+        assert!(!app.opening());
+        apply(&mut app, &broker, Action::Open);
+        assert_eq!(apply(&mut app, &broker, Action::Focus), None, "f cancels o");
         assert!(!app.opening());
 
         app.set_shown_links(0);

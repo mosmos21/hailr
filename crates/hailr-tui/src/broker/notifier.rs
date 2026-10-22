@@ -84,6 +84,9 @@ mod tests {
         fn attach_command(&self, _: &PaneId) -> Result<Command, MuxError> {
             unimplemented!()
         }
+        fn focus(&self, _: &PaneId) -> Result<(), MuxError> {
+            unimplemented!()
+        }
         fn notify(&self, title: &str, body: &str) -> Result<(), MuxError> {
             let now = self.running.fetch_add(1, Ordering::SeqCst) + 1;
             self.most.fetch_max(now, Ordering::SeqCst);
