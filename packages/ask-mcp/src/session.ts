@@ -1,7 +1,12 @@
 import { type Broker, BrokerUnavailable, type Question, Rejected } from "./broker.ts";
+import {
+  type ChannelNotification,
+  channelNotification,
+  permissionVerdict,
+} from "./channel.ts";
 import type { ClientEvent } from "./events.ts";
 
-export type Notify = (content: string, meta: Record<string, string>) => Promise<void>;
+export type Notify = (notification: ChannelNotification) => Promise<void>;
 
 type SessionBroker = Pick<
   Broker,
@@ -25,7 +30,10 @@ export class Session {
     this.#notify = notify;
     this.#retryMs = retryMs;
     broker.onEvent = (event) => this.#handle(event);
-    broker.onLost = () => this.#lost();
+    broker.onLost = () => {
+      this.#forgetPermissions();
+      this.#lost();
+    };
   }
 
   get clientId(): string {
@@ -37,7 +45,7 @@ export class Session {
   }
 
   /** 登録の直後に届く回答を取りこぼさないよう、送る前に手元に置く。
-   * 失敗は ask_human のエラーとして Claude に返り、Claude が聞き直すので、broker に届いていても手元からは消す */
+   * 失敗は呼び出し元が Claude に返すか pane に任せるので、broker に届いていても手元からは消す */
   async ask(question: Question): Promise<void> {
     this.#pending.set(question.id, question);
     try {
@@ -56,19 +64,39 @@ export class Session {
       return;
     }
     this.#pending.delete(event.id);
+    const sent = this.#reply(question, event);
+    sent?.catch((e: unknown) => console.error(`hailr: cannot tell Claude: ${String(e)}`));
+  }
+
+  #reply(question: Question, event: ClientEvent): Promise<void> | undefined {
+    if (question.body.kind === "permission") {
+      // Claude Code には権限確認の取り下げを受ける口が無いため、返さない
+      if (event.type !== "answered") {
+        return undefined;
+      }
+      const verdict =
+        event.answer === "Allow" ? "allow" : event.answer === "Deny" ? "deny" : undefined;
+      if (!verdict) {
+        console.error(`hailr: ${event.id} was answered with neither Allow nor Deny`);
+        return undefined;
+      }
+      return this.#notify(permissionVerdict(question.body.requestId, verdict));
+    }
     const title = question.body.title;
     const meta = { question_id: event.id };
     let sent: Promise<void> | undefined;
     if (event.type === "answered") {
       const content = `The human answered "${title}": ${event.answer}`;
-      sent = this.#notify(content, { ...meta, event: "answered" });
+      sent = this.#notify(channelNotification(content, { ...meta, event: "answered" }));
     } else {
       switch (event.reason) {
         case "deleted":
-          sent = this.#notify(`The human dismissed "${title}" without answering.`, {
-            ...meta,
-            event: "dismissed",
-          });
+          sent = this.#notify(
+            channelNotification(`The human dismissed "${title}" without answering.`, {
+              ...meta,
+              event: "dismissed",
+            }),
+          );
           break;
         case "answered_in_pane":
         case "pane_closed":
@@ -77,7 +105,7 @@ export class Session {
           event.reason satisfies never;
       }
     }
-    sent?.catch((e: unknown) => console.error(`hailr: cannot tell Claude: ${String(e)}`));
+    return sent;
   }
 
   /** 未回答が無ければ次の ask までつながない。送り直しの最中なら、終わってからもう一度送る */
@@ -151,6 +179,15 @@ export class Session {
       }
     }
     return done;
+  }
+
+  /** 端末で答え済みの権限確認は知らせが来ないため、切れた時点のものは古いカードとして出し直さない */
+  #forgetPermissions(): void {
+    for (const question of this.pending()) {
+      if (question.body.kind === "permission") {
+        this.#pending.delete(question.id);
+      }
+    }
   }
 
   /** 失敗が続く間は最初の 1 回だけ出す */

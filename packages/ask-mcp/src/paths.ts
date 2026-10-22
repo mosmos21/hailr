@@ -12,3 +12,8 @@ export function socketPath(env: Env): string | undefined {
     (home ? path.join(home, ".local", "state") : undefined);
   return base && path.join(base, "hailr", "broker.sock");
 }
+
+/** herdr の CLI は `-` で始まる引数をオプションとして読むため、そういう pane ID は使わない */
+export function inHerdrPane(paneId: string | undefined): paneId is string {
+  return !!paneId && !paneId.startsWith("-");
+}

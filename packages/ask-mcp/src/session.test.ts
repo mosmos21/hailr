@@ -2,6 +2,7 @@ import { afterEach, expect, onTestFinished, test, vi } from "vitest";
 
 import { BrokerUnavailable, type Question, Rejected } from "./broker.ts";
 import type { ClientEvent } from "./events.ts";
+import { type ChannelNotification, channelNotification, permissionVerdict } from "./channel.ts";
 import { type Notify, Session } from "./session.ts";
 
 afterEach(() => {
@@ -20,7 +21,7 @@ function question(id: string, title = "Merge?"): Question {
 
 function setup() {
   const calls: string[] = [];
-  const notices: [string, Record<string, string>][] = [];
+  const notices: ChannelNotification[] = [];
   let connect = async () => {};
   let register = async (_: Question) => {};
   const broker = {
@@ -38,8 +39,8 @@ function setup() {
     close: () => calls.push("close"),
   };
   let fail = false;
-  const notify: Notify = async (content, meta) => {
-    notices.push([content, meta]);
+  const notify: Notify = async (n) => {
+    notices.push(n);
     if (fail) throw new Error("stdout closed");
   };
   const session = new Session(broker, notify);
@@ -101,8 +102,11 @@ test("tells Claude about answers and dismissals once", async () => {
   s.broker.onEvent({ type: "answered", id: "unknown", answer: "x" });
   expect(log).toHaveBeenCalledWith(expect.stringContaining("unknown"));
   expect(s.notices).toEqual([
-    ['The human answered "Ta": Yes', { question_id: "a", event: "answered" }],
-    ['The human dismissed "Tb" without answering.', { question_id: "b", event: "dismissed" }],
+    channelNotification('The human answered "Ta": Yes', { question_id: "a", event: "answered" }),
+    channelNotification('The human dismissed "Tb" without answering.', {
+      question_id: "b",
+      event: "dismissed",
+    }),
   ]);
   expect(s.session.pending()).toEqual([]);
 });
@@ -243,4 +247,70 @@ test("waits for the next question when nothing is pending, and stops on close", 
   s.session.close();
   await vi.advanceTimersByTimeAsync(5000);
   expect(s.calls).toEqual(["connect", "register q1", "close"]);
+});
+
+function permission(id: string, requestId: string): Question {
+  return {
+    ...question(id),
+    body: { kind: "permission", requestId, toolName: "Bash", description: "d", inputPreview: "p" },
+  };
+}
+
+test("answers permission requests with allow or deny and nothing else", async () => {
+  const log = vi.spyOn(console, "error").mockImplementation(() => {});
+  onTestFinished(() => log.mockRestore());
+  const s = setup();
+  const odd = ["Yes", "constructor", "toString", "__proto__"];
+  for (const [id, requestId] of [["p1", "abcde"], ["p2", "fghij"], ["p4", "qrstu"]] as const) {
+    await s.session.ask(permission(id, requestId));
+  }
+  for (const answer of odd) {
+    await s.session.ask(permission(answer, "kmnop"));
+  }
+  s.broker.onEvent({ type: "answered", id: "p1", answer: "Allow" });
+  s.broker.onEvent({ type: "answered", id: "p2", answer: "Deny" });
+  for (const answer of odd) {
+    s.broker.onEvent({ type: "answered", id: answer, answer });
+  }
+  s.broker.onEvent({ type: "withdrawn", id: "p4", reason: "deleted" });
+  expect(s.notices).toEqual([permissionVerdict("abcde", "allow"), permissionVerdict("fghij", "deny")]);
+  expect(log).toHaveBeenCalledWith(expect.stringContaining("neither Allow nor Deny"));
+  expect(s.session.pending()).toEqual([]);
+});
+
+test("does not bring back permission requests after reconnecting", async () => {
+  vi.useFakeTimers();
+  const s = setup();
+  await s.session.ask(permission("p1", "abcde"));
+  await s.session.ask(question("q1"));
+  s.calls.length = 0;
+  s.broker.onLost();
+  expect(s.session.pending().map((q) => q.id)).toEqual(["q1"]);
+  await vi.advanceTimersByTimeAsync(1000);
+  expect(s.calls).toEqual(["connect", "register q1"]);
+
+  s.broker.onEvent({ type: "answered", id: "q1", answer: "x" });
+  await s.session.ask(permission("p2", "fghij"));
+  s.calls.length = 0;
+  s.broker.onLost();
+  await vi.advanceTimersByTimeAsync(5000);
+  expect(s.calls).toEqual([]);
+});
+
+test("keeps a permission request that arrives while reconnecting", async () => {
+  vi.useFakeTimers();
+  const s = setup();
+  await s.session.ask(question("q1"));
+  s.calls.length = 0;
+  const reject = s.holdConnect();
+  s.broker.onLost();
+  await vi.advanceTimersByTimeAsync(1000);
+  const asking = s.session.ask(permission("p1", "abcde"));
+  reject(new BrokerUnavailable("ENOENT"));
+  await expect(asking).rejects.toBeInstanceOf(BrokerUnavailable);
+  s.failConnect(false);
+  await s.session.ask(permission("p2", "fghij"));
+  await vi.advanceTimersByTimeAsync(1000);
+  s.broker.onEvent({ type: "answered", id: "p2", answer: "Allow" });
+  expect(s.notices).toEqual([permissionVerdict("fghij", "allow")]);
 });
