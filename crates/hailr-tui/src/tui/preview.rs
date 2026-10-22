@@ -65,7 +65,6 @@ fn to_text(ansi: &str) -> Text<'static> {
 
 #[cfg(test)]
 mod tests {
-    use std::process::Command;
     use std::sync::Mutex;
 
     use hailr_core::mux::{MuxError, PaneInfo};
@@ -100,9 +99,6 @@ mod tests {
                 return Err(MuxError::InvalidPane);
             }
             Ok(format!("screen of {}", pane.0))
-        }
-        fn attach_command(&self, _: &PaneId) -> Result<Command, MuxError> {
-            unimplemented!()
         }
         fn focus(&self, _: &PaneId) -> Result<(), MuxError> {
             unimplemented!()

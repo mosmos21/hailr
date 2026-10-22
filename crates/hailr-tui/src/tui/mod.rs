@@ -5,7 +5,6 @@ mod view;
 
 use std::future::Future;
 use std::io;
-use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -13,8 +12,7 @@ use crossterm::event::{Event, EventStream};
 use futures_util::StreamExt;
 use hailr_core::mux::Mux;
 use hailr_core::protocol::{PaneId, QuestionId, WithdrawReason};
-use ratatui::backend::CrosstermBackend;
-use ratatui::{DefaultTerminal, Terminal};
+use ratatui::DefaultTerminal;
 use tokio::sync::{Notify, mpsc, watch};
 
 use crate::broker::Broker;
@@ -96,7 +94,7 @@ async fn run_loop(
     app.set_questions(broker.snapshot());
     let (pane_tx, pane_rx) = watch::channel(app.selected_pane());
     let (shot_tx, mut shots) = mpsc::channel(1);
-    let (focus_tx, mut not_focused) = mpsc::unbounded_channel();
+    let (focus_tx, mut focused) = mpsc::unbounded_channel();
     let previewing = tokio::spawn(preview::run(Arc::clone(&mux), pane_rx, shot_tx));
     let _stop_previewing = AbortOnDrop(previewing);
     let mut events = EventStream::new();
@@ -121,25 +119,16 @@ async fn run_loop(
                                 app.set_notice(format!("not opened: {e}"));
                             }
                         }
-                        Effect::Focus(pane) => {
+                        Effect::Focus(id, pane) => {
                             // herdr を待つ間も broker と描画を止めないよう、別のスレッドで呼んで結果だけ受け取る
                             let (mux, tx) = (Arc::clone(&mux), focus_tx.clone());
                             tokio::task::spawn_blocking(move || {
-                                if let Err(e) = mux.focus(&pane) {
-                                    let _ = tx.send(format!("not focused on {}: {e}", pane.0));
-                                }
+                                let result = mux
+                                    .focus(&pane)
+                                    .map(|()| id)
+                                    .map_err(|e| format!("not focused on {}: {e}", pane.0));
+                                let _ = tx.send(result);
                             });
-                        }
-                        Effect::Attach(id, pane) => {
-                            // crossterm の読み手が子に渡した端末の入力を横取りするため、渡す前に落とす
-                            drop(events);
-                            let attached = attach(terminal, &*mux, broker, &id, &pane, stop.as_mut(), panicked);
-                            let Some(handover) = attached.await? else {
-                                return Ok(());
-                            };
-                            discard_typeahead()?;
-                            events = EventStream::new();
-                            back_from_attach(&mut app, broker, &id, handover);
                         }
                     },
                     Step::Nothing => {}
@@ -150,12 +139,7 @@ async fn run_loop(
                 app.expire_answered(Instant::now(), broker.snapshot());
             }
             Some(shot) = shots.recv() => app.set_shot(shot),
-            Some(e) = not_focused.recv() => {
-                // 遅れて届いた失敗で、あとから出た知らせを消さない
-                if app.notice().is_none() {
-                    app.set_notice(e);
-                }
-            }
+            Some(result) = focused.recv() => after_focus(&mut app, broker, result),
         }
         let repointed = pane_tx.send_if_modified(|pane| {
             let selected = app.selected_pane();
@@ -172,8 +156,7 @@ async fn run_loop(
 /// TUI の外で行うこと
 #[derive(Debug, PartialEq, Eq)]
 enum Effect {
-    Attach(QuestionId, PaneId),
-    Focus(PaneId),
+    Focus(QuestionId, PaneId),
     Open(String),
 }
 
@@ -200,7 +183,6 @@ fn apply(app: &mut App, broker: &Broker, action: Action) -> Option<Effect> {
         action,
         Action::Answer(_)
             | Action::Delete
-            | Action::Attach
             | Action::Focus
             | Action::Open
             | Action::Reply
@@ -218,11 +200,7 @@ fn apply(app: &mut App, broker: &Broker, action: Action) -> Option<Effect> {
         action,
         Action::Answer(_) | Action::Delete | Action::Reply | Action::Click(Target::Button(_))
     );
-    // 返事は Enter で送るため、送った直後の押し直しを attach にしない
-    let replied = app
-        .selected()
-        .is_some_and(|q| matches!(app.answered_with(q.id), Some(Choice::Reply(_))));
-    if (settling && app.selected_is_answered()) || (action == Action::Attach && replied) {
+    if settling && app.selected_is_answered() {
         return None;
     }
     match action {
@@ -263,12 +241,11 @@ fn apply(app: &mut App, broker: &Broker, action: Action) -> Option<Effect> {
                 app.set_questions(broker.snapshot());
             }
         }
-        Action::Attach => {
+        Action::Focus => {
             return app
                 .selected()
-                .map(|q| Effect::Attach(q.id, q.pane_id.clone()));
+                .map(|q| Effect::Focus(q.id, q.pane_id.clone()));
         }
-        Action::Focus => return app.selected_pane().map(Effect::Focus),
         Action::Reply => app.start_reply(),
         Action::Open => {
             if app.shown_links() > 0 {
@@ -350,168 +327,12 @@ fn send_reply(app: &mut App, broker: &Broker) {
     }
 }
 
-enum Handover {
-    /// 子を起こせなかった
-    Refused(String),
-    /// 人が attach から抜けた。herdr が 0 以外で終わったときは、その様子を持つ
-    Returned(Option<String>),
-}
-
-enum Waited {
-    Exited(io::Result<std::process::ExitStatus>),
-    Stopped,
-    Panicked,
-}
-
-/// stop のときは None
-async fn attach(
-    terminal: &mut DefaultTerminal,
-    mux: &dyn Mux,
-    broker: &Broker,
-    id: &QuestionId,
-    pane: &PaneId,
-    stop: Pin<&mut impl Future<Output = ()>>,
-    panicked: &Notify,
-) -> io::Result<Option<Handover>> {
-    let command = match mux.attach_command(pane) {
-        Ok(command) => command,
-        Err(e) => {
-            tracing::warn!("cannot attach to {:?}: {e}", pane.0);
-            return Ok(Some(Handover::Refused(e.to_string())));
-        }
-    };
-    leave(terminal)?;
-    let child = match spawn_attach(command, broker, id) {
-        Ok(child) => child,
-        Err(e) => {
-            enter(terminal)?;
-            tracing::warn!("cannot attach to {:?}: {e}", pane.0);
-            return Ok(Some(Handover::Refused(format!("cannot start herdr: {e}"))));
-        }
-    };
-    match wait_child(child, stop, panicked).await {
-        Waited::Exited(result) => {
-            enter(terminal)?;
-            Ok(Some(Handover::Returned(ended(pane, result))))
-        }
-        Waited::Stopped => {
-            reset_modes();
-            Ok(None)
-        }
-        Waited::Panicked => {
-            reset_modes();
-            Err(io::Error::other("a task panicked"))
-        }
-    }
-}
-
-/// 起こせなかった pane には印を付けない
-fn spawn_attach(
-    command: std::process::Command,
-    broker: &Broker,
-    id: &QuestionId,
-) -> io::Result<tokio::process::Child> {
-    let child = tokio::process::Command::from(command)
-        .kill_on_drop(true)
-        .spawn()?;
-    broker.mark_attached(id);
-    Ok(child)
-}
-
-/// stop と panic のときは子を殺す
-async fn wait_child(
-    mut child: tokio::process::Child,
-    stop: Pin<&mut impl Future<Output = ()>>,
-    panicked: &Notify,
-) -> Waited {
-    let waited = tokio::select! {
-        biased;
-        () = panicked.notified() => Waited::Panicked,
-        () = stop => Waited::Stopped,
-        result = child.wait() => return Waited::Exited(result),
-    };
-    let _ = child.kill().await;
-    waited
-}
-
-fn ended(pane: &PaneId, result: io::Result<std::process::ExitStatus>) -> Option<String> {
+/// pane で答えたら取り下げられるよう、移せた質問にだけ印を付ける。遅れて届いた失敗で、あとから出た知らせを消さない
+fn after_focus(app: &mut App, broker: &Broker, result: Result<QuestionId, String>) {
     match result {
-        Ok(status) if status.success() => None,
-        Ok(status) => {
-            tracing::warn!("attach to {} ended with {status}", pane.0);
-            Some(format!("herdr {status}"))
-        }
-        Err(e) => {
-            tracing::warn!("cannot wait for the attach to {}: {e}", pane.0);
-            Some(format!("cannot wait for herdr: {e}"))
-        }
-    }
-}
-
-/// raw mode は解かずに渡す。解くと crossterm が元の端末の設定を忘れ、herdr を殺したときに戻せなくなるため
-fn leave(terminal: &mut DefaultTerminal) -> io::Result<()> {
-    terminal.show_cursor()?;
-    crossterm::execute!(
-        io::stdout(),
-        crossterm::event::DisableMouseCapture,
-        crossterm::event::DisableBracketedPaste,
-        crossterm::terminal::LeaveAlternateScreen
-    )
-}
-
-/// ratatui の init は panic の hook を重ねて入れ、`Terminal::clear` は戻った直後に答えの遅れる位置の問い合わせをするため、Terminal だけを作り直す
-fn enter(terminal: &mut DefaultTerminal) -> io::Result<()> {
-    crossterm::execute!(
-        io::stdout(),
-        crossterm::terminal::EnterAlternateScreen,
-        crossterm::terminal::Clear(crossterm::terminal::ClearType::All),
-        ReportClicks,
-        crossterm::event::EnableBracketedPaste
-    )?;
-    *terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
-    Ok(())
-}
-
-/// 殺された herdr は自分で入れたモードを戻せないため、こちらで切る。端末が閉じていれば書けないので失敗は無視する
-fn reset_modes() {
-    let _ = crossterm::execute!(
-        io::stdout(),
-        crossterm::event::DisableMouseCapture,
-        crossterm::event::DisableBracketedPaste,
-        crossterm::event::DisableFocusChange,
-        crossterm::event::PopKeyboardEnhancementFlags,
-        crossterm::style::Print("\x1b[?1l\x1b>"),
-        crossterm::cursor::Show
-    );
-}
-
-/// EventStream を落としても crossterm の内部に読み終えたキーが残り、戻った直後に再生されるため捨てる。
-/// 落としたときの起こしが 1 回ぶん空の poll として返るため、空が 2 回続くまで読む
-fn discard_typeahead() -> io::Result<()> {
-    let mut empty = 0;
-    while empty < 2 {
-        if crossterm::event::poll(std::time::Duration::ZERO)? {
-            crossterm::event::read()?;
-            empty = 0;
-        } else {
-            empty += 1;
-        }
-    }
-    Ok(())
-}
-
-/// attach の間につなぎ直しで写しが作り直されると印が消えるため、付け直す
-fn back_from_attach(app: &mut App, broker: &Broker, id: &QuestionId, handover: Handover) {
-    let notice = match handover {
-        Handover::Refused(reason) => Some(format!("not attached: {reason}")),
-        Handover::Returned(ended) => {
-            broker.mark_attached(id);
-            ended.map(|ended| format!("attach ended: {ended}"))
-        }
-    };
-    app.set_questions(broker.snapshot());
-    if let Some(notice) = notice {
-        app.set_notice(notice);
+        Ok(id) => broker.mark_focused(&id),
+        Err(e) if app.notice().is_none() => app.set_notice(e),
+        Err(_) => {}
     }
 }
 
@@ -559,6 +380,7 @@ impl Drop for AbortOnDrop {
 #[cfg(test)]
 mod tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
     use hailr_core::mux::{AgentStatus, PaneInfo};
     use hailr_core::protocol::{ClientEvent, ClientId, Question, QuestionBody};
     use uuid::Uuid;
@@ -759,11 +581,7 @@ mod tests {
             app.answered_with(question.id),
             Some(&Choice::Reply("1qdf ok".into()))
         );
-        assert_eq!(
-            on_event(&mut app, &broker, &enter()),
-            Step::Nothing,
-            "a second Enter does not attach"
-        );
+        assert_eq!(on_event(&mut app, &broker, &enter()), Step::Nothing);
         on_event(&mut app, &broker, &char('r'));
         assert_eq!(app.reply(), None, "no second reply while it is kept");
 
@@ -1039,7 +857,7 @@ mod tests {
         next.asked_at = 2;
         next.pane_id = PaneId("w1:p2".into());
         let mut app = second_selected(&broker, &[first.clone(), next.clone()]);
-        let target = Some(Effect::Focus(next.pane_id.clone()));
+        let target = Some(Effect::Focus(next.id, next.pane_id.clone()));
         assert_eq!(apply(&mut app, &broker, Action::Focus), target);
         apply(&mut app, &broker, Action::Answer(0));
         assert_eq!(apply(&mut app, &broker, Action::Focus), target, "answered");
@@ -1050,172 +868,44 @@ mod tests {
     }
 
     #[test]
-    fn attaches_to_the_selected_pane_only_after_a_choice() {
+    fn marks_only_a_question_whose_pane_was_focused() {
         let broker = Broker::new();
         let client = ClientId(Uuid::new_v4());
         let (_events, _guard) = broker.connect(client);
-        let mut app = App::default();
-        assert_eq!(
-            apply(&mut app, &broker, Action::Attach),
-            None,
-            "no questions"
-        );
-
-        let first = ask(client, &["Yes"]);
-        let mut next = ask(client, &[]);
-        next.asked_at = 2;
-        next.pane_id = PaneId("w1:p2".into());
-        let mut app = second_selected(&broker, &[first.clone(), next.clone()]);
-        let target = Some(Effect::Attach(next.id, next.pane_id.clone()));
-        assert_eq!(apply(&mut app, &broker, Action::Attach), target);
-
-        apply(&mut app, &broker, Action::Previous);
-        apply(&mut app, &broker, Action::Answer(0));
-        wait_out(&mut app, &broker);
-        assert_eq!(apply(&mut app, &broker, Action::Attach), None, "moved");
-        assert!(app.notice().unwrap().contains("pick a question first"));
-    }
-
-    #[test]
-    fn marks_the_question_again_when_coming_back_from_the_pane() {
-        let broker = Broker::new();
-        let client = ClientId(Uuid::new_v4());
-        let question = ask(client, &[]);
-        let (_old, guard) = broker.connect(client);
-        broker.register(question.clone()).unwrap();
-        broker.mark_attached(&question.id);
-        // attach の間に ask-mcp がつなぎ直し、同じ質問を登録し直した
-        drop(guard);
-        let (mut events, _guard) = broker.connect(client);
-        broker.register(question.clone()).unwrap();
-        let mut app = App::default();
-
-        let ended = Some("herdr exit status: 1".into());
-        back_from_attach(&mut app, &broker, &question.id, Handover::Returned(ended));
-        assert_eq!(app.notice(), Some("attach ended: herdr exit status: 1"));
-        assert_eq!(app.selected().map(|q| q.id), Some(question.id));
-        for status in [AgentStatus::Idle, AgentStatus::Working] {
-            let pane = PaneInfo {
-                id: question.pane_id.clone(),
-                status,
-                label: String::new(),
-            };
-            broker.reconcile_panes(broker.listing_start(), &[pane]);
-        }
-        let withdrawn = ClientEvent::Withdrawn {
-            id: question.id,
-            reason: WithdrawReason::AnsweredInPane,
+        let mut question = ask(client, &[]);
+        question.body = QuestionBody::Permission {
+            request_id: "abcde".into(),
+            tool_name: "Bash".into(),
+            description: "d".into(),
+            input_preview: "p".into(),
         };
-        assert_eq!(events.try_recv().unwrap(), withdrawn);
-    }
-
-    #[test]
-    fn does_not_mark_a_question_whose_pane_could_not_be_attached() {
-        let broker = Broker::new();
-        let client = ClientId(Uuid::new_v4());
-        let (mut events, _guard) = broker.connect(client);
-        let question = ask(client, &[]);
         broker.register(question.clone()).unwrap();
         let mut app = App::default();
-
-        let refused = Handover::Refused("invalid pane id".into());
-        back_from_attach(&mut app, &broker, &question.id, refused);
-        assert_eq!(app.notice(), Some("not attached: invalid pane id"));
-        for status in [AgentStatus::Idle, AgentStatus::Working] {
-            let pane = PaneInfo {
-                id: question.pane_id.clone(),
-                status,
-                label: String::new(),
-            };
-            broker.reconcile_panes(broker.listing_start(), &[pane]);
-        }
-        assert!(events.try_recv().is_err(), "still waiting for an answer");
-    }
-
-    fn spawn(script: &str) -> tokio::process::Child {
-        tokio::process::Command::new("sh")
-            .args(["-c", script])
-            .kill_on_drop(true)
-            .spawn()
-            .unwrap()
-    }
-
-    #[tokio::test]
-    async fn marks_the_question_only_once_the_attach_started() {
-        let broker = Broker::new();
-        let client = ClientId(Uuid::new_v4());
-        let (mut events, _guard) = broker.connect(client);
-        let question = ask(client, &[]);
-        broker.register(question.clone()).unwrap();
-        let answered_in_pane = |events: &mut tokio::sync::mpsc::Receiver<ClientEvent>| {
+        app.set_questions(broker.snapshot());
+        let pane = |status| PaneInfo {
+            id: question.pane_id.clone(),
+            status,
+            label: String::new(),
+        };
+        let answer_in_pane = |broker: &Broker| {
             for status in [AgentStatus::Idle, AgentStatus::Working] {
-                let pane = PaneInfo {
-                    id: question.pane_id.clone(),
-                    status,
-                    label: String::new(),
-                };
-                broker.reconcile_panes(broker.listing_start(), &[pane]);
+                broker.reconcile_panes(broker.listing_start(), &[pane(status)]);
             }
-            events.try_recv().is_ok()
         };
 
-        let missing = std::process::Command::new("/nonexistent/herdr");
-        assert!(spawn_attach(missing, &broker, &question.id).is_err());
-        assert!(!answered_in_pane(&mut events), "not marked");
+        app.set_notice("not answered: later");
+        after_focus(&mut app, &broker, Err("not focused on w1:p1: x".into()));
+        assert_eq!(app.notice(), Some("not answered: later"), "kept");
+        answer_in_pane(&broker);
+        assert_eq!(broker.snapshot().len(), 1, "no mark without a focus");
 
-        let mut child =
-            spawn_attach(std::process::Command::new("true"), &broker, &question.id).unwrap();
-        child.wait().await.unwrap();
-        assert!(answered_in_pane(&mut events), "marked");
-    }
-
-    #[tokio::test]
-    async fn tells_how_the_attach_ended() {
-        let stop = std::future::pending::<()>();
-        tokio::pin!(stop);
-        let pane = PaneId("w1:p1".into());
-        let cases = [
-            ("exit 0", None),
-            ("exit 3", Some("herdr exit status: 3")),
-            ("kill -9 $$", Some("herdr signal: 9 (SIGKILL)")),
-        ];
-        for (script, expected) in cases {
-            let waited = wait_child(spawn(script), stop.as_mut(), &Notify::new()).await;
-            let Waited::Exited(result) = waited else {
-                panic!("{script} should exit");
-            };
-            assert_eq!(ended(&pane, result).as_deref(), expected, "{script}");
-        }
-    }
-
-    #[tokio::test]
-    async fn kills_the_attach_on_stop_or_panic() {
-        let stop = std::future::ready(());
-        tokio::pin!(stop);
-        let child = spawn("sleep 10");
-        let pid = child.id().unwrap().to_string();
-        let waited = wait_child(child, stop, &Notify::new()).await;
-        assert!(matches!(waited, Waited::Stopped));
-        assert!(!alive(&pid), "the child is gone on stop");
-
-        let stop = std::future::pending::<()>();
-        tokio::pin!(stop);
-        let panicked = Notify::new();
-        panicked.notify_one();
-        let child = spawn("sleep 10");
-        let pid = child.id().unwrap().to_string();
-        let waited = wait_child(child, stop, &panicked).await;
-        assert!(matches!(waited, Waited::Panicked));
-        assert!(!alive(&pid), "the child is gone on panic");
-    }
-
-    fn alive(pid: &str) -> bool {
-        std::process::Command::new("kill")
-            .args(["-0", pid])
-            .stderr(std::process::Stdio::null())
-            .status()
-            .unwrap()
-            .success()
+        app.clear_notice();
+        after_focus(&mut app, &broker, Err("not focused on w1:p1: x".into()));
+        assert_eq!(app.notice(), Some("not focused on w1:p1: x"));
+        after_focus(&mut app, &broker, Ok(question.id));
+        assert!(app.notice().is_some(), "a success leaves the notice");
+        answer_in_pane(&broker);
+        assert!(broker.snapshot().is_empty(), "answered in the pane");
     }
 
     fn with_links(client: ClientId, links: &[&str]) -> Question {
@@ -1291,11 +981,8 @@ mod tests {
         assert_eq!(app.selected_index(), selected, "and does nothing else");
         app.set_shown_links(2);
         apply(&mut app, &broker, Action::Open);
-        assert_eq!(
-            apply(&mut app, &broker, Action::Attach),
-            None,
-            "Enter only cancels"
-        );
+        assert_eq!(on_event(&mut app, &broker, &enter()), Step::Nothing);
+        assert!(!app.opening(), "Enter only cancels");
         apply(&mut app, &broker, Action::Open);
         assert_eq!(apply(&mut app, &broker, Action::Delete), None);
         assert_eq!(broker.snapshot().len(), 1, "d only cancels");

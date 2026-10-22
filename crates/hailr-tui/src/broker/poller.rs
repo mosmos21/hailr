@@ -7,7 +7,7 @@ use super::Broker;
 
 pub const INTERVAL: Duration = Duration::from_secs(2);
 
-/// pane の一覧を周期的に取り、attach して pane で答えた質問を取り下げる
+/// pane の一覧を周期的に取り、画面を移したあと pane で答えた権限確認を取り下げる
 pub async fn run(broker: Arc<Broker>, mux: Arc<dyn Mux>) {
     let mut ticks = tokio::time::interval(INTERVAL);
     ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -43,7 +43,6 @@ async fn poll_once(broker: &Broker, mux: &Arc<dyn Mux>) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use std::process::Command;
     use std::sync::Mutex;
 
     use hailr_core::mux::{AgentStatus, MuxError, PaneInfo};
@@ -66,9 +65,6 @@ mod tests {
         fn read_pane(&self, _: &PaneId) -> Result<String, MuxError> {
             unimplemented!()
         }
-        fn attach_command(&self, _: &PaneId) -> Result<Command, MuxError> {
-            unimplemented!()
-        }
         fn focus(&self, _: &PaneId) -> Result<(), MuxError> {
             unimplemented!()
         }
@@ -83,11 +79,11 @@ mod tests {
             client_id: client,
             pane_id: PaneId(pane.into()),
             asked_at: 1,
-            body: QuestionBody::Ask {
-                title: "t".into(),
-                question: "q".into(),
-                options: vec![],
-                links: vec![],
+            body: QuestionBody::Permission {
+                request_id: "abcde".into(),
+                tool_name: "Bash".into(),
+                description: "d".into(),
+                input_preview: "p".into(),
             },
         }
     }
@@ -107,7 +103,7 @@ mod tests {
         let (_rx, _guard) = broker.connect(client);
         let q = question(client, "w1:p1");
         broker.register(q.clone()).unwrap();
-        broker.mark_attached(&q.id);
+        broker.mark_focused(&q.id);
 
         let fake = Arc::new(FakeMux(Mutex::new(Ok(vec![pane(AgentStatus::Idle)]))));
         let mux: Arc<dyn Mux> = fake.clone();
