@@ -1,10 +1,21 @@
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 
 use hailr_core::protocol::{PaneId, Question, QuestionId};
+use ratatui::layout::{Position, Rect};
 use ratatui::text::Text;
 
 /// pane の画面を読んだ結果。読めなかったときは理由を持つ
 pub type Shot = (PaneId, Result<Text<'static>, String>);
+
+/// クリックで選べるもの
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Target {
+    Question(QuestionId),
+    /// 0 から数えたボタンの位置
+    Button(usize),
+    /// 0 から数えたリンクの位置
+    Link(usize),
+}
 
 /// 画面に出すものと、選んでいる質問
 #[derive(Default)]
@@ -22,6 +33,8 @@ pub struct App {
     /// 待ちの中で直前に開いたリンク。押しっぱなしで同じリンクを何度も開かない
     opened: Option<usize>,
     shown_links: Cell<usize>,
+    /// 直前の描画でクリックできた場所
+    targets: RefCell<Vec<(Rect, Target)>>,
 }
 
 impl App {
@@ -133,6 +146,31 @@ impl App {
     /// 同じ待ちの中で直前に開いたリンクなら false
     pub fn mark_opened(&mut self, link: usize) -> bool {
         self.opened.replace(link) != Some(link)
+    }
+
+    /// 人がクリックで選んだ。選び直し待ちを解く
+    pub fn select(&mut self, id: QuestionId) {
+        if self.questions.iter().any(|q| q.id == id) {
+            self.selected = Some(id);
+            self.moved = false;
+        }
+    }
+
+    pub fn clear_targets(&self) {
+        self.targets.borrow_mut().clear();
+    }
+
+    pub fn add_target(&self, area: Rect, target: Target) {
+        self.targets.borrow_mut().push((area, target));
+    }
+
+    pub fn target_at(&self, column: u16, row: u16) -> Option<Target> {
+        let position = Position::new(column, row);
+        let targets = self.targets.borrow();
+        targets
+            .iter()
+            .find(|(area, _)| area.contains(position))
+            .map(|&(_, target)| target)
     }
 
     fn move_selection(&mut self, step: impl Fn(usize) -> usize) {

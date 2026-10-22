@@ -5,7 +5,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, List, ListState, Paragraph, Wrap};
 
-use super::app::App;
+use super::app::{App, Target};
 use crate::config::Side;
 use crate::text::printable;
 
@@ -15,6 +15,7 @@ const WARNING: Color = Color::Yellow;
 
 /// 見た目の決めごとは DESIGN.md
 pub fn draw(frame: &mut Frame, app: &App, side: Side) {
+    app.clear_targets();
     let [body, footer] =
         Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(frame.area());
     let list_width = (u32::from(body.width) * 3 / 10).clamp(24, 40) as u16;
@@ -79,6 +80,7 @@ fn draw_list(frame: &mut Frame, app: &App, area: Rect) {
         draw_empty(frame, block, area);
         return;
     }
+    let inner = block.inner(area);
     let titles = app
         .questions()
         .iter()
@@ -90,6 +92,11 @@ fn draw_list(frame: &mut Frame, app: &App, area: Rect) {
         .highlight_style(Style::new().fg(ACCENT).add_modifier(Modifier::BOLD));
     let mut state = ListState::default().with_selected(app.selected_index());
     frame.render_stateful_widget(list, area, &mut state);
+    let shown = app.questions().iter().skip(state.offset());
+    for (y, question) in (inner.y..inner.bottom()).zip(shown) {
+        let row = Rect::new(inner.x, y, inner.width, 1);
+        app.add_target(row, Target::Question(question.id));
+    }
 }
 
 fn draw_question(frame: &mut Frame, app: &App, question: &Question, area: Rect) {
@@ -144,11 +151,21 @@ fn draw_question(frame: &mut Frame, app: &App, question: &Question, area: Rect) 
                     ),
                     buttons: 0,
                     links: 0,
+                    targets: vec![],
                 });
             }
         }
         app.set_shown_buttons(rows.iter().map(|row| row.buttons).sum());
         app.set_shown_links(rows.iter().map(|row| row.links).sum());
+        if inner.width >= 4 {
+            for (y, row) in (inner.y..inner.bottom()).zip(&rows) {
+                for &(x, width, target) in &row.targets {
+                    let area =
+                        Rect::new(inner.x.saturating_add(x), y, width, 1).intersection(inner);
+                    app.add_target(area, target);
+                }
+            }
+        }
         let lines: Vec<Line> = rows.into_iter().map(|row| row.line).collect();
         frame.render_widget(Paragraph::new(lines).block(block), choices);
     }
@@ -183,6 +200,8 @@ struct Row {
     line: Line<'static>,
     buttons: usize,
     links: usize,
+    /// 行の中でクリックできる場所（左端からの位置と幅）
+    targets: Vec<(u16, u16, Target)>,
 }
 
 /// 選択肢を `[ 1 Yes ]` の形で並べ、幅に入るだけ 1 行に詰める。ボタンの途中では折り返さない
@@ -190,16 +209,21 @@ fn button_rows(body: &QuestionBody, width: u16) -> Vec<Row> {
     let mut rows: Vec<Row> = Vec::new();
     for (i, option) in body.options().iter().enumerate() {
         let button = Span::styled(format!("[ {} {} ]", i + 1, printable(option)), ACCENT);
+        let size = u16::try_from(button.width()).unwrap_or(u16::MAX);
+        let target = Target::Button(i);
         match rows.last_mut() {
             Some(row) if row.line.width() + 1 + button.width() <= usize::from(width) => {
+                let x = u16::try_from(row.line.width() + 1).unwrap_or(u16::MAX);
                 row.line.push_span(" ");
                 row.line.push_span(button);
                 row.buttons += 1;
+                row.targets.push((x, size, target));
             }
             _ => rows.push(Row {
                 line: Line::from(button),
                 buttons: 1,
                 links: 0,
+                targets: vec![(0, size, target)],
             }),
         }
     }
@@ -224,6 +248,11 @@ fn link_rows(body: &QuestionBody, width: u16) -> Vec<Row> {
                 ]),
                 buttons: 0,
                 links: usize::from(openable),
+                targets: if openable {
+                    vec![(0, width, Target::Link(i))]
+                } else {
+                    vec![]
+                },
             }
         })
         .collect()
@@ -867,5 +896,90 @@ mod tests {
             "after one that cannot open"
         );
         assert_eq!(rows[1].line.to_string(), "o2 a.b");
+    }
+
+    #[test]
+    fn records_where_to_click() {
+        let mut app = App::default();
+        let first = ask("w1:p1", "First", "q");
+        let long = format!("https://{}/x", "h".repeat(60));
+        let second = with_links(&["Yes", "No"], &["https://a.b/", &long]);
+        app.set_questions(vec![first.clone(), second.clone()]);
+        app.select(second.id);
+        let rows = render(&app, Side::Right, 60, 30);
+        let at = |text: &str| {
+            let y = rows.iter().position(|r| r.contains(text)).unwrap();
+            let x = rows[y].find(text).unwrap();
+            let x = rows[y][..x].chars().count();
+            (u16::try_from(x).unwrap(), u16::try_from(y).unwrap())
+        };
+
+        let (list_x, list_y) = at("First");
+        assert_eq!(
+            app.target_at(list_x, list_y),
+            Some(Target::Question(first.id))
+        );
+        let (x, y) = at("[ 2 No ]");
+        assert_eq!(app.target_at(x, y), Some(Target::Button(1)));
+        assert_eq!(app.target_at(x + 7, y), Some(Target::Button(1)));
+        assert_eq!(app.target_at(x - 1, y), None, "the gap between buttons");
+        let (x, y) = at("o1 a.b");
+        assert_eq!(app.target_at(x + 4, y), Some(Target::Link(0)));
+        let (x, y) = at("o2 ");
+        assert_eq!(app.target_at(x, y), None, "a link that cannot open");
+        let (x, y) = at("Questions");
+        assert_eq!(app.target_at(x, y), None, "the border");
+
+        let (button_x, button_y) = at("[ 2 No ]");
+        app.select(first.id);
+        render(&app, Side::Right, 60, 30);
+        assert_eq!(
+            app.target_at(button_x, button_y),
+            None,
+            "a question without buttons"
+        );
+        app.set_questions(vec![]);
+        render(&app, Side::Right, 60, 30);
+        assert_eq!(app.target_at(list_x, list_y), None, "an empty list");
+    }
+
+    #[test]
+    fn clicks_the_rows_the_list_scrolled_to() {
+        let mut app = App::default();
+        let questions: Vec<_> = (0..20)
+            .map(|i| ask("w1:p1", &format!("Question {i:02}"), "q"))
+            .collect();
+        app.set_questions(questions.clone());
+        let rows = render(&app, Side::Right, 80, 12);
+        assert_eq!(rows[1].chars().nth(56), Some('│'));
+        let left = 56;
+        let right = 79;
+        assert_eq!(app.target_at(left, 1), None, "the left border");
+        assert_eq!(app.target_at(right, 1), None, "the right border");
+        assert_eq!(
+            app.target_at(left + 1, 1),
+            Some(Target::Question(questions[0].id))
+        );
+        assert_eq!(
+            app.target_at(left + 1, 10),
+            None,
+            "the bottom border with more below"
+        );
+
+        app.select(questions[19].id);
+        let rows = render(&app, Side::Right, 80, 12);
+        let top = rows[1].clone();
+        let title = &top[top.find("Question").unwrap()..][..11];
+        assert_ne!(title, "Question 00", "the list scrolled");
+        let x =
+            u16::try_from(rows[1][..rows[1].find("Question").unwrap()].chars().count()).unwrap();
+        let shown = questions.iter().find(|q| q.body.title() == title).unwrap();
+        assert_eq!(app.target_at(x, 1), Some(Target::Question(shown.id)));
+        assert_eq!(
+            app.target_at(x, 9),
+            Some(Target::Question(questions[19].id))
+        );
+        assert_eq!(app.target_at(x, 0), None, "the border");
+        assert_eq!(app.target_at(x, 10), None, "the bottom border");
     }
 }
