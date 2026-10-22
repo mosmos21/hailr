@@ -5,6 +5,7 @@ use hailr_core::protocol::{QuestionBody, QuestionId};
 use tokio::sync::broadcast::{self, error::RecvError};
 
 use super::Broker;
+use crate::text::is_unprintable;
 
 const MAX_TITLE: usize = 100;
 const MAX_BODY: usize = 300;
@@ -44,32 +45,13 @@ fn notice(body: &QuestionBody) -> (String, String) {
 fn plain(text: &str, max: usize) -> String {
     let mut out: String = text
         .chars()
-        .map(|c| {
-            if c.is_control() || is_hidden(c) {
-                ' '
-            } else {
-                c
-            }
-        })
+        .map(|c| if is_unprintable(c) { ' ' } else { c })
         .take(max)
         .collect();
     if text.chars().nth(max).is_some() {
         out.push('…');
     }
     out
-}
-
-/// 向きを変える文字、行の区切り、見えない書式文字
-fn is_hidden(c: char) -> bool {
-    matches!(
-        c,
-        '\u{061C}'
-            | '\u{200B}'..='\u{200F}'
-            | '\u{2028}'..='\u{202E}'
-            | '\u{2060}'..='\u{2069}'
-            | '\u{FEFF}'
-            | '\u{E0000}'..='\u{E007F}'
-    )
 }
 
 #[cfg(test)]
@@ -237,29 +219,6 @@ mod tests {
     #[test]
     fn blanks_c1_controls_too() {
         assert_eq!(plain("a\u{009B}2Jb\u{0085}c", 10), "a 2Jb c");
-    }
-
-    #[test]
-    fn blanks_hidden_characters_only() {
-        for c in [
-            '\u{061C}',
-            '\u{200B}',
-            '\u{200F}',
-            '\u{2028}',
-            '\u{202E}',
-            '\u{2060}',
-            '\u{2069}',
-            '\u{FEFF}',
-            '\u{E0000}',
-            '\u{E007F}',
-        ] {
-            assert!(is_hidden(c), "{:X}", c as u32);
-        }
-        for c in [
-            '\u{200A}', '\u{2027}', '\u{202F}', '\u{205F}', '\u{206A}', 'あ',
-        ] {
-            assert!(!is_hidden(c), "{:X}", c as u32);
-        }
     }
 
     #[test]

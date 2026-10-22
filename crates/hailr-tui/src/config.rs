@@ -11,6 +11,22 @@ use serde::Deserialize;
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
     pub mux: MuxKind,
+    pub ui: Ui,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Ui {
+    pub questions: Side,
+}
+
+/// 質問の一覧を画面のどちら側に置くか
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Side {
+    Left,
+    #[default]
+    Right,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
@@ -65,8 +81,24 @@ mod tests {
     }
 
     #[test]
+    fn reads_the_side_of_the_question_list() {
+        assert_eq!(
+            toml::from_str::<Config>("").unwrap().ui.questions,
+            Side::Right
+        );
+        let config = toml::from_str::<Config>("[ui]\nquestions = \"left\"").unwrap();
+        assert_eq!(config.ui.questions, Side::Left);
+    }
+
+    #[test]
     fn rejects_unknown_values_and_keys() {
-        for input in ["mux = \"tmux\"", "mux = \"Herdr\"", "muxx = \"herdr\""] {
+        for input in [
+            "mux = \"tmux\"",
+            "mux = \"Herdr\"",
+            "muxx = \"herdr\"",
+            "[ui]\nquestions = \"top\"",
+            "[ui]\nlist = \"left\"",
+        ] {
             assert!(toml::from_str::<Config>(input).is_err(), "{input}");
         }
     }

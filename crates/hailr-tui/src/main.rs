@@ -3,12 +3,15 @@
 mod broker;
 mod config;
 mod log;
+mod text;
+mod tui;
 
 use std::process::ExitCode;
 use std::sync::Arc;
 
 use hailr_core::paths;
 use tokio::signal::unix::{SignalKind, signal};
+use tokio::sync::oneshot;
 
 use broker::{Broker, notifier, poller, serve, socket};
 use config::Config;
@@ -48,17 +51,47 @@ async fn main() -> ExitCode {
         broker.arrivals(),
         Arc::clone(&mux),
     ));
-    let polling = tokio::spawn(poller::run(Arc::clone(&broker), mux));
-    let result = serve::run(listener, socket_file, broker, terminated()).await;
+    let polling = tokio::spawn(poller::run(Arc::clone(&broker), Arc::clone(&mux)));
+    let (quit_tx, quit_rx) = oneshot::channel::<()>();
+    let quit = async {
+        let _ = quit_rx.await;
+    };
+    let mut serving = tokio::spawn(serve::run(listener, socket_file, Arc::clone(&broker), quit));
+
+    // broker が先に止まったら、質問が届かない画面を出し続けないよう TUI も閉じる
+    let mut served = None;
+    let shown = tui::run(broker, mux, config.ui.questions, async {
+        tokio::select! {
+            () = terminated() => {}
+            result = &mut serving => served = Some(result),
+        }
+    })
+    .await;
+    let _ = quit_tx.send(());
+    let served = match served {
+        Some(result) => result,
+        None => serving.await,
+    };
     polling.abort();
     notifying.abort();
-    match result {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(e) => {
+
+    let mut code = ExitCode::SUCCESS;
+    if let Err(e) = shown {
+        eprintln!("hailr: the screen failed: {e}");
+        code = ExitCode::FAILURE;
+    }
+    match served {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
             eprintln!("hailr: {e}");
-            ExitCode::FAILURE
+            code = ExitCode::FAILURE;
+        }
+        Err(e) => {
+            eprintln!("hailr: the broker stopped unexpectedly: {e}");
+            code = ExitCode::FAILURE;
         }
     }
+    code
 }
 
 /// 端末を閉じたとき（SIGHUP）も、ソケットを消してから終わる
