@@ -1,6 +1,10 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+/// `ask_human` の `options` と `links` の上限。ask-mcp と broker の両方で検査する
+pub const MAX_OPTIONS: usize = 9;
+pub const MAX_LINKS: usize = 5;
+
 pub const PERMISSION_ALLOW: &str = "Allow";
 pub const PERMISSION_DENY: &str = "Deny";
 
