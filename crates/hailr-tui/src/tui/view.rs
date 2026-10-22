@@ -126,7 +126,7 @@ fn draw_question(frame: &mut Frame, app: &App, question: &Question, area: Rect) 
     let answered = app.answered_with(question.id);
     let typing = app
         .reply()
-        .filter(|(id, _)| *id == question.id)
+        .filter(|(id, _)| *id == question.id && !app.reply_gone())
         .map(|(_, text)| text);
     let sent = match answered {
         Some(Choice::Reply(text)) => Some(text.as_str()),
@@ -739,6 +739,21 @@ mod tests {
             "no box under another question\n{text}"
         );
         assert!(!text.contains("hhh"), "{text}");
+
+        let mut app = App::default();
+        let question = with_options(&["Yes"]);
+        app.set_questions(vec![question.clone()]);
+        app.start_reply();
+        app.type_reply("half");
+        app.set_questions(vec![]);
+        app.set_questions(vec![question]);
+        let rows = render(&app, Side::Right, 80, 16);
+        let text = rows.join("\n");
+        assert!(
+            !text.contains("┌Reply"),
+            "back on its own, not typeable\n{text}"
+        );
+        assert_eq!(rows[15].trim_end(), " the question went away  Esc close");
     }
 
     #[test]
