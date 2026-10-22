@@ -1,16 +1,27 @@
 // TUI から呼ぶ操作は後続の PR で入るため、それまで未使用の警告を止める
 #[allow(dead_code)]
 mod broker;
+mod config;
 
 use std::process::ExitCode;
+use std::sync::Arc;
 
 use hailr_core::paths;
 use tokio::signal::unix::{SignalKind, signal};
 
-use broker::{Broker, serve, socket};
+use broker::{Broker, poller, serve, socket};
+use config::Config;
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> ExitCode {
+    let config = match paths::config_path().map(|p| Config::load(&p)) {
+        Some(Ok(config)) => config,
+        Some(Err(e)) => {
+            eprintln!("hailr: {e}");
+            return ExitCode::FAILURE;
+        }
+        None => Config::default(),
+    };
     let Some(path) = paths::socket_path() else {
         eprintln!("hailr: cannot decide the socket path (HOME is not an absolute path)");
         return ExitCode::FAILURE;
@@ -24,7 +35,11 @@ async fn main() -> ExitCode {
     };
     eprintln!("hailr: listening on {}", path.display());
 
-    match serve::run(listener, socket_file, Broker::new(), terminated()).await {
+    let broker = Broker::new();
+    let polling = tokio::spawn(poller::run(Arc::clone(&broker), config.mux()));
+    let result = serve::run(listener, socket_file, broker, terminated()).await;
+    polling.abort();
+    match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("hailr: {e}");

@@ -1,3 +1,4 @@
+use hailr_core::mux::{AgentStatus, PaneInfo};
 use hailr_core::protocol::PaneId;
 use uuid::Uuid;
 
@@ -19,6 +20,14 @@ fn ask(client: ClientId, asked_at: u64, options: &[&str]) -> Question {
             options: options.iter().map(|o| o.to_string()).collect(),
             links: vec![],
         },
+    }
+}
+
+fn pane(id: &str, status: AgentStatus) -> PaneInfo {
+    PaneInfo {
+        id: PaneId(id.into()),
+        status,
+        label: id.into(),
     }
 }
 
@@ -268,6 +277,77 @@ fn reconnecting_drops_the_previous_copies() {
     broker.register(q.clone()).unwrap();
     broker.withdraw(&q.id, WithdrawReason::Deleted);
     assert!(new_rx.try_recv().is_ok());
+}
+
+/// 一覧を取り始めてから終わるまでを 1 回ぶん流す
+fn poll(broker: &Broker, status: AgentStatus) {
+    broker.reconcile_panes(broker.listing_start(), &[pane("w1:p1", status)]);
+}
+
+#[test]
+fn reconcile_keeps_questions_of_unlisted_and_unattached_panes() {
+    let broker = Broker::new();
+    let c = client();
+    let (mut rx, _guard) = broker.connect(c);
+    let mut unlisted = ask(c, 1, &[]);
+    unlisted.pane_id = PaneId("w1:p9".into());
+    let unattached = ask(c, 2, &[]);
+    broker.register(unlisted.clone()).unwrap();
+    broker.register(unattached.clone()).unwrap();
+    broker.mark_attached(&unlisted.id);
+
+    for status in [AgentStatus::Idle, AgentStatus::Working] {
+        poll(&broker, status);
+    }
+    assert!(rx.try_recv().is_err());
+    assert_eq!(broker.snapshot(), vec![unlisted, unattached]);
+}
+
+#[test]
+fn reconcile_withdraws_once_the_attached_pane_waits_then_works() {
+    for (waiting, arms) in [
+        (AgentStatus::Idle, true),
+        (AgentStatus::Blocked, true),
+        (AgentStatus::Other("unknown".into()), false),
+        (AgentStatus::Working, false),
+    ] {
+        let broker = Broker::new();
+        let c = client();
+        let (mut rx, _guard) = broker.connect(c);
+        let q = ask(c, 1, &[]);
+        broker.register(q.clone()).unwrap();
+        broker.mark_attached(&q.id);
+
+        poll(&broker, waiting.clone());
+        poll(&broker, AgentStatus::Working);
+        if arms {
+            assert_eq!(
+                rx.try_recv().unwrap(),
+                ClientEvent::Withdrawn {
+                    id: q.id,
+                    reason: WithdrawReason::AnsweredInPane
+                },
+                "{waiting:?}"
+            );
+        } else {
+            assert_eq!(broker.snapshot(), vec![q], "{waiting:?}");
+        }
+    }
+}
+
+#[test]
+fn reconcile_ignores_a_listing_started_before_the_attach() {
+    let broker = Broker::new();
+    let c = client();
+    let (_rx, _guard) = broker.connect(c);
+    let q = ask(c, 1, &[]);
+    broker.register(q.clone()).unwrap();
+
+    let start = broker.listing_start();
+    broker.mark_attached(&q.id);
+    broker.reconcile_panes(start, &[pane("w1:p1", AgentStatus::Idle)]);
+    poll(&broker, AgentStatus::Working);
+    assert_eq!(broker.snapshot(), vec![q]);
 }
 
 #[test]
