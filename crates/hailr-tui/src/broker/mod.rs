@@ -8,6 +8,7 @@ use hailr_core::protocol::{
 use tokio::sync::{mpsc, watch};
 
 pub mod http;
+pub mod serve;
 pub mod socket;
 
 const CLIENT_QUEUE: usize = 16;
@@ -183,6 +184,15 @@ impl Broker {
             entry.question.client_id,
             ClientEvent::Withdrawn { id: *id, reason },
         );
+        drop(state);
+        self.changed();
+    }
+
+    /// 全 client の送り手を手放す。SSE のストリームが終わり、ask-mcp の接続が閉じる
+    pub fn close_all(&self) {
+        let mut state = self.lock();
+        state.clients.clear();
+        state.questions.clear();
         drop(state);
         self.changed();
     }
