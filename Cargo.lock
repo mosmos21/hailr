@@ -54,6 +54,8 @@ version = "0.1.0"
 dependencies = [
  "hailr-core",
  "libc",
+ "serde",
+ "serde_json",
  "wait-timeout",
 ]
 
