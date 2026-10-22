@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use hailr_core::mux::{AgentStatus, PaneInfo};
@@ -6,19 +6,24 @@ use hailr_core::protocol::{
     ClientEvent, ClientId, MAX_LINKS, MAX_OPTIONS, Question, QuestionBody, QuestionId,
     WithdrawReason,
 };
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{broadcast, mpsc, watch};
 
 pub mod http;
+pub mod notifier;
 pub mod poller;
 pub mod serve;
 pub mod socket;
 
 const CLIENT_QUEUE: usize = 16;
+const ARRIVALS: usize = 16;
+// tokio の broadcast は容量を 2 のべき乗に切り上げるため、溢れる件数を ARRIVALS どおりにする
+const _: () = assert!(ARRIVALS.is_power_of_two());
 
 /// 全 pane の未回答の質問の写しと、接続中の ask-mcp を持つ。質問の正は ask-mcp 側にある
 pub struct Broker {
     state: Mutex<State>,
     changes: watch::Sender<u64>,
+    arrivals: broadcast::Sender<QuestionId>,
 }
 
 #[derive(Default)]
@@ -27,6 +32,8 @@ struct State {
     clients: HashMap<ClientId, Client>,
     next_connection: u64,
     attaches: u64,
+    /// つなぎ直した ask-mcp の再登録で鳴らし直さないよう、回答・取り下げまで覚えておく
+    notified: HashSet<QuestionId>,
 }
 
 struct Entry {
@@ -97,6 +104,7 @@ impl Broker {
         Arc::new(Self {
             state: Mutex::default(),
             changes: watch::Sender::new(0),
+            arrivals: broadcast::Sender::new(ARRIVALS),
         })
     }
 
@@ -145,6 +153,10 @@ impl Broker {
                 Registered::Updated
             }
             None => {
+                if state.notified.insert(question.id) {
+                    // 受け手が居ないときは知らせる相手が居ないだけなので、送れなくても捨てる
+                    let _ = self.arrivals.send(question.id);
+                }
                 state.questions.insert(
                     question.id,
                     Entry {
@@ -189,6 +201,7 @@ impl Broker {
             ClientEvent::Answered { id: *id, answer },
         );
         state.questions.remove(id);
+        state.notified.remove(id);
         drop(state);
         self.changed();
         if delivered {
@@ -256,8 +269,24 @@ impl Broker {
         let mut state = self.lock();
         state.clients.clear();
         state.questions.clear();
+        state.notified.clear();
         drop(state);
         self.changed();
+    }
+
+    /// 通知する質問の今の写しを返す。無ければ通知済みから外し、切断中だった質問がつなぎ直して再登録されたときに鳴らす
+    pub fn to_announce(&self, id: &QuestionId) -> Option<Question> {
+        let mut state = self.lock();
+        let question = state.questions.get(id).map(|entry| entry.question.clone());
+        if question.is_none() {
+            state.notified.remove(id);
+        }
+        question
+    }
+
+    /// 初めて届いた質問の ID を受け取る
+    pub fn arrivals(&self) -> broadcast::Receiver<QuestionId> {
+        self.arrivals.subscribe()
     }
 
     /// 状態が変わるたびに値が増える
@@ -294,6 +323,7 @@ fn withdraw(state: &mut State, id: &QuestionId, reason: WithdrawReason) -> bool 
     let Some(entry) = state.questions.remove(id) else {
         return false;
     };
+    state.notified.remove(id);
     let event = ClientEvent::Withdrawn { id: *id, reason };
     send(state, entry.question.client_id, event);
     true

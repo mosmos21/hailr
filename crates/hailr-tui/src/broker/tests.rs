@@ -279,6 +279,79 @@ fn reconnecting_drops_the_previous_copies() {
     assert!(new_rx.try_recv().is_ok());
 }
 
+#[test]
+fn announces_a_question_once_even_across_reconnects() {
+    let broker = Broker::new();
+    let mut arrivals = broker.arrivals();
+    let c = client();
+    let (_old_rx, _old_guard) = broker.connect(c);
+    let mut q = ask(c, 1, &[]);
+    broker.register(q.clone()).unwrap();
+    assert_eq!(arrivals.try_recv().unwrap(), q.id);
+
+    q.body = ask(c, 1, &["Yes"]).body;
+    broker.register(q.clone()).unwrap();
+    let (_new_rx, _new_guard) = broker.connect(c);
+    assert_eq!(broker.register(q.clone()), Ok(Registered::New));
+    assert!(
+        arrivals.try_recv().is_err(),
+        "updates and re-registers stay quiet"
+    );
+}
+
+#[test]
+fn announces_again_once_a_question_is_settled() {
+    let broker = Broker::new();
+    let mut arrivals = broker.arrivals();
+    let c = client();
+    let (_rx, _guard) = broker.connect(c);
+    type Settle = fn(&Broker, &Question);
+    let settles: [(&str, Settle); 3] = [
+        ("answer", |b, q| b.answer(&q.id, "Yes".into()).unwrap()),
+        ("withdraw", |b, q| {
+            b.withdraw(&q.id, WithdrawReason::Deleted)
+        }),
+        ("answered in the pane", |b, q| {
+            b.mark_attached(&q.id);
+            poll(b, AgentStatus::Idle);
+            poll(b, AgentStatus::Working);
+        }),
+    ];
+    for (name, settle) in settles {
+        let q = ask(c, 1, &["Yes"]);
+        broker.register(q.clone()).unwrap();
+        settle(&broker, &q);
+        broker.register(q.clone()).unwrap();
+        assert_eq!(arrivals.try_recv().unwrap(), q.id, "{name}");
+        assert_eq!(arrivals.try_recv().unwrap(), q.id, "{name}");
+        assert!(arrivals.try_recv().is_err(), "{name}");
+        broker.withdraw(&q.id, WithdrawReason::Deleted);
+    }
+}
+
+#[test]
+fn announces_after_a_reconnect_only_if_the_notifier_missed_it() {
+    let broker = Broker::new();
+    let mut arrivals = broker.arrivals();
+    let c = client();
+    for missed in [false, true] {
+        let q = ask(c, 1, &[]);
+        let (_rx, guard) = broker.connect(c);
+        broker.register(q.clone()).unwrap();
+        if !missed {
+            assert!(broker.to_announce(&q.id).is_some());
+        }
+        drop(guard);
+        if missed {
+            assert_eq!(broker.to_announce(&q.id), None);
+        }
+        let (_rx, _guard) = broker.connect(c);
+        assert_eq!(broker.register(q.clone()), Ok(Registered::New));
+        let announced = std::iter::from_fn(|| arrivals.try_recv().ok()).count();
+        assert_eq!(announced, if missed { 2 } else { 1 }, "missed: {missed}");
+    }
+}
+
 /// 一覧を取り始めてから終わるまでを 1 回ぶん流す
 fn poll(broker: &Broker, status: AgentStatus) {
     broker.reconcile_panes(broker.listing_start(), &[pane("w1:p1", status)]);
