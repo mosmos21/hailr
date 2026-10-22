@@ -46,11 +46,13 @@ async fn main() -> ExitCode {
 
     let broker = Broker::new();
     let mux = config.mux();
-    let notifying = tokio::spawn(notifier::run(
-        Arc::clone(&broker),
-        broker.arrivals(),
-        Arc::clone(&mux),
-    ));
+    let notifying = config.notify.toast.then(|| {
+        tokio::spawn(notifier::run(
+            Arc::clone(&broker),
+            broker.arrivals(),
+            Arc::clone(&mux),
+        ))
+    });
     let polling = tokio::spawn(poller::run(Arc::clone(&broker), Arc::clone(&mux)));
     let (quit_tx, quit_rx) = oneshot::channel::<()>();
     let quit = async {
@@ -73,7 +75,9 @@ async fn main() -> ExitCode {
         None => serving.await,
     };
     polling.abort();
-    notifying.abort();
+    if let Some(notifying) = notifying {
+        notifying.abort();
+    }
 
     let mut code = ExitCode::SUCCESS;
     if let Err(e) = shown {

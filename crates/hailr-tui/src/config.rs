@@ -12,6 +12,13 @@ use serde::Deserialize;
 pub struct Config {
     pub mux: MuxKind,
     pub ui: Ui,
+    pub notify: Notify,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Notify {
+    pub toast: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
@@ -91,6 +98,18 @@ mod tests {
     }
 
     #[test]
+    fn shows_toasts_only_when_asked() {
+        for input in ["", "[notify]", "[notify]\ntoast = false"] {
+            assert!(
+                !toml::from_str::<Config>(input).unwrap().notify.toast,
+                "{input}"
+            );
+        }
+        let config = toml::from_str::<Config>("[notify]\ntoast = true").unwrap();
+        assert!(config.notify.toast);
+    }
+
+    #[test]
     fn rejects_unknown_values_and_keys() {
         for input in [
             "mux = \"tmux\"",
@@ -98,6 +117,8 @@ mod tests {
             "muxx = \"herdr\"",
             "[ui]\nquestions = \"top\"",
             "[ui]\nlist = \"left\"",
+            "[notify]\ntoast = \"yes\"",
+            "[notify]\nsound = true",
         ] {
             assert!(toml::from_str::<Config>(input).is_err(), "{input}");
         }
