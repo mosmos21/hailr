@@ -18,7 +18,7 @@ use tokio::sync::{Notify, mpsc, watch};
 
 use crate::broker::Broker;
 use crate::config::Side;
-use app::App;
+use app::{App, Target};
 use input::Action;
 
 /// 端末を代替画面に切り替えて質問を出す。q / Ctrl-C、`stop`、入力が閉じたときに戻して終わる
@@ -28,9 +28,14 @@ pub async fn run(
     side: Side,
     stop: impl Future<Output = ()>,
 ) -> io::Result<()> {
-    let mut terminal = match ratatui::try_init() {
+    let started = ratatui::try_init().and_then(|terminal| {
+        crossterm::execute!(io::stdout(), ReportClicks)?;
+        Ok(terminal)
+    });
+    let mut terminal = match started {
         Ok(terminal) => terminal,
         Err(e) => {
+            release_mouse();
             ratatui::restore();
             return Err(e);
         }
@@ -41,11 +46,28 @@ pub async fn run(
     let previous_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         on_panic.notify_one();
+        // ratatui の restore はマウスの報告を止めないため、ここで止める
+        release_mouse();
         previous_hook(info);
     }));
     let result = run_loop(&mut terminal, &broker, mux, side, stop, &panicked).await;
+    release_mouse();
     ratatui::restore();
     result
+}
+
+/// crossterm の EnableMouseCapture はポインタの移動も報告させ、動かすたびに描き直すことになるため、押下と離しだけを SGR 形式で頼む
+struct ReportClicks;
+
+impl crossterm::Command for ReportClicks {
+    fn write_ansi(&self, f: &mut impl std::fmt::Write) -> std::fmt::Result {
+        f.write_str("\x1b[?1000h\x1b[?1006h")
+    }
+}
+
+/// 端末が閉じていれば書けないので失敗は無視する
+fn release_mouse() {
+    let _ = crossterm::execute!(io::stdout(), crossterm::event::DisableMouseCapture);
 }
 
 async fn run_loop(
@@ -76,7 +98,7 @@ async fn run_loop(
             event = events.next() => match event {
                 None => return Ok(()),
                 Some(Err(e)) => return Err(e),
-                Some(Ok(event)) => match input::action(&event) {
+                Some(Ok(event)) => match input::action(&event).or_else(|| input::click(&event, &app)) {
                     Some(Action::Quit) => return Ok(()),
                     Some(action) => match apply(&mut app, broker, action) {
                         Some(Effect::Open(link)) => {
@@ -136,14 +158,22 @@ fn apply(app: &mut App, broker: &Broker, action: Action) -> Option<Effect> {
                 let url = app.selected()?.body.links().get(link)?.clone();
                 return app.mark_opened(link).then_some(Effect::Open(url));
             }
-            Action::Answer(_) | Action::Open => {}
-            _ => app.end_opening(),
+            Action::Answer(_) | Action::Open => return None,
+            // クリックは押した先がはっきりしているので、待ちを終えてそのまま行う
+            Action::Click(_) => app.end_opening(),
+            _ => {
+                app.end_opening();
+                return None;
+            }
         }
-        return None;
     }
     let acts = matches!(
         action,
-        Action::Answer(_) | Action::Delete | Action::Attach | Action::Open
+        Action::Answer(_)
+            | Action::Delete
+            | Action::Attach
+            | Action::Open
+            | Action::Click(Target::Button(_) | Target::Link(_))
     );
     if acts && app.selected().is_none() {
         return None;
@@ -156,6 +186,14 @@ fn apply(app: &mut App, broker: &Broker, action: Action) -> Option<Effect> {
     match action {
         Action::Previous => app.select_previous(),
         Action::Next => app.select_next(),
+        Action::Click(Target::Question(id)) => app.select(id),
+        Action::Click(Target::Button(button)) => return apply(app, broker, Action::Answer(button)),
+        Action::Click(Target::Link(link)) if link < app.shown_links() => {
+            return Some(Effect::Open(
+                app.selected()?.body.links().get(link)?.clone(),
+            ));
+        }
+        Action::Click(Target::Link(_)) => {}
         Action::Answer(button) => {
             let question = app.selected()?;
             if button >= app.shown_buttons() {
@@ -291,7 +329,11 @@ fn ended(pane: &PaneId, result: io::Result<std::process::ExitStatus>) -> Option<
 /// raw mode は解かずに渡す。解くと crossterm が元の端末の設定を忘れ、herdr を殺したときに戻せなくなるため
 fn leave(terminal: &mut DefaultTerminal) -> io::Result<()> {
     terminal.show_cursor()?;
-    crossterm::execute!(io::stdout(), crossterm::terminal::LeaveAlternateScreen)
+    crossterm::execute!(
+        io::stdout(),
+        crossterm::event::DisableMouseCapture,
+        crossterm::terminal::LeaveAlternateScreen
+    )
 }
 
 /// ratatui の init は panic の hook を重ねて入れ、`Terminal::clear` は戻った直後に答えの遅れる位置の問い合わせをするため、Terminal だけを作り直す
@@ -299,7 +341,8 @@ fn enter(terminal: &mut DefaultTerminal) -> io::Result<()> {
     crossterm::execute!(
         io::stdout(),
         crossterm::terminal::EnterAlternateScreen,
-        crossterm::terminal::Clear(crossterm::terminal::ClearType::All)
+        crossterm::terminal::Clear(crossterm::terminal::ClearType::All),
+        ReportClicks
     )?;
     *terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
     Ok(())
@@ -828,5 +871,45 @@ mod tests {
         ] {
             assert!(checked_url(link).is_err(), "{link}");
         }
+    }
+
+    #[test]
+    fn answers_and_selects_by_click() {
+        let broker = Broker::new();
+        let client = ClientId(Uuid::new_v4());
+        let (mut events, _guard) = broker.connect(client);
+        let first = with_links(client, &["https://a.example/"]);
+        let mut next = with_links(client, &["https://b.example/"]);
+        next.asked_at = 2;
+        let mut app = second_selected(&broker, &[first.clone(), next.clone()]);
+        app.set_shown_links(1);
+
+        let click = |target| Action::Click(target);
+        let opened = apply(&mut app, &broker, click(Target::Link(0)));
+        assert_eq!(opened, Some(Effect::Open("https://b.example/".into())));
+        assert_eq!(
+            apply(&mut app, &broker, click(Target::Link(1))),
+            None,
+            "hidden link"
+        );
+
+        apply(&mut app, &broker, Action::Open);
+        apply(&mut app, &broker, click(Target::Button(0)));
+        assert!(!app.opening(), "a click ends the wait");
+        let answered = ClientEvent::Answered {
+            id: next.id,
+            answer: "Yes".into(),
+        };
+        assert_eq!(events.try_recv().unwrap(), answered, "and answers");
+
+        assert!(app.moved_on_its_own());
+        apply(&mut app, &broker, click(Target::Button(0)));
+        assert!(events.try_recv().is_err(), "not after the selection moved");
+        let link = apply(&mut app, &broker, click(Target::Link(0)));
+        assert_eq!(link, None, "no link either");
+        apply(&mut app, &broker, click(Target::Question(first.id)));
+        assert!(!app.moved_on_its_own(), "a click on the list is a choice");
+        apply(&mut app, &broker, click(Target::Button(0)));
+        assert!(events.try_recv().is_ok());
     }
 }

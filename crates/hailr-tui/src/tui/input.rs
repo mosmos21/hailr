@@ -1,4 +1,8 @@
-use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
+
+use super::app::{App, Target};
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Action {
@@ -9,6 +13,7 @@ pub enum Action {
     Delete,
     Attach,
     Open,
+    Click(Target),
     Quit,
 }
 
@@ -36,6 +41,20 @@ pub fn action(event: &Event) -> Option<Action> {
         KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => Some(Action::Quit),
         _ => None,
     }
+}
+
+/// 左ボタンの押下だけを見る。場所は直前の描画で引く
+pub fn click(event: &Event, app: &App) -> Option<Action> {
+    let Event::Mouse(MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column,
+        row,
+        ..
+    }) = event
+    else {
+        return None;
+    };
+    app.target_at(*column, *row).map(Action::Click)
 }
 
 pub fn is_press(event: &Event) -> bool {
@@ -92,5 +111,37 @@ mod tests {
         assert_eq!(press(KeyCode::Char('c'), none), None);
         let release = key(KeyCode::Char('q'), none, KeyEventKind::Release);
         assert_eq!(action(&release), None);
+    }
+
+    #[test]
+    fn clicks_with_the_left_button_only() {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        use ratatui::layout::Rect;
+
+        let app = App::default();
+        app.add_target(Rect::new(3, 1, 2, 1), Target::Button(0));
+        let mouse = |kind, column, row| {
+            Event::Mouse(MouseEvent {
+                kind,
+                column,
+                row,
+                modifiers: KeyModifiers::NONE,
+            })
+        };
+        let left = MouseEventKind::Down(MouseButton::Left);
+        assert_eq!(
+            click(&mouse(left, 4, 1), &app),
+            Some(Action::Click(Target::Button(0)))
+        );
+        assert_eq!(click(&mouse(left, 1, 4), &app), None, "column and row");
+        for kind in [
+            MouseEventKind::Up(MouseButton::Left),
+            MouseEventKind::Down(MouseButton::Right),
+            MouseEventKind::Drag(MouseButton::Left),
+            MouseEventKind::Moved,
+            MouseEventKind::ScrollDown,
+        ] {
+            assert_eq!(click(&mouse(kind, 4, 1), &app), None, "{kind:?}");
+        }
     }
 }
