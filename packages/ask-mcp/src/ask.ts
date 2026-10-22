@@ -1,6 +1,7 @@
 import * as z from "zod";
 
 import { BrokerUnavailable, Rejected } from "./broker.ts";
+import { inHerdrPane } from "./paths.ts";
 import type { Session } from "./session.ts";
 
 const text = z.string().refine((s) => s.trim() !== "", "must not be empty");
@@ -40,7 +41,7 @@ export const description = [
 /** 登録できたら Claude に返す文、できなければ理由を投げる */
 export async function askHuman(input: AskInput, deps: AskDeps): Promise<string> {
   const { session, paneId } = deps;
-  if (!paneId || paneId.startsWith("-")) {
+  if (!inHerdrPane(paneId)) {
     throw new Error("ask_human works only inside a herdr pane; ask in the pane instead");
   }
   if (!session) {

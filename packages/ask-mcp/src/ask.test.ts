@@ -33,6 +33,7 @@ test.each(["question-ask.json", "question-ask-minimal.json"])(
   async (name) => {
     const expected = fixture(name);
     const { value, asked } = deps();
+    if (expected.body.kind !== "ask") throw new Error("fixture is not an ask");
     const { title, question, options, links } = expected.body;
     const input = {
       title,

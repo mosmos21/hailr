@@ -13,13 +13,21 @@ export type Question = {
   clientId: string;
   paneId: string;
   askedAt: number;
-  body: {
-    kind: "ask";
-    title: string;
-    question: string;
-    options: string[];
-    links: string[];
-  };
+  body:
+    | {
+        kind: "ask";
+        title: string;
+        question: string;
+        options: string[];
+        links: string[];
+      }
+    | {
+        kind: "permission";
+        requestId: string;
+        toolName: string;
+        description: string;
+        inputPreview: string;
+      };
 };
 
 /** 区切りが来ないまま伸び続ける SSE を読み続けないため、1 件の上限を文字数で置く */
