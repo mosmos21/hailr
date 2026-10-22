@@ -14,12 +14,12 @@ pub async fn run(broker: Arc<Broker>, mux: Arc<dyn Mux>) {
     let mut last_error = None;
     loop {
         ticks.tick().await;
-        // herdr が止まっていると毎周期同じ失敗になるため、変わったときと戻ったときだけ出す
+        // herdr が止まっていると毎周期同じ失敗になるため、変わったときと戻ったときだけ記録する
         match poll_once(&broker, &mux).await {
-            Ok(()) if last_error.take().is_some() => eprintln!("hailr: listing panes works again"),
+            Ok(()) if last_error.take().is_some() => tracing::info!("listing panes works again"),
             Ok(()) => {}
             Err(e) if last_error.as_ref() != Some(&e) => {
-                eprintln!("hailr: cannot list panes: {e}");
+                tracing::warn!("cannot list panes: {e}");
                 last_error = Some(e);
             }
             Err(_) => {}

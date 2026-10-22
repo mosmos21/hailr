@@ -38,7 +38,7 @@ pub async fn run(
     tokio::select! {
         result = server => result,
         () = deadline => {
-            eprintln!("hailr: closed connections that did not finish in time");
+            tracing::warn!("closed connections that did not finish in time");
             Ok(())
         }
     }
