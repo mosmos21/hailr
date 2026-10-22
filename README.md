@@ -60,3 +60,10 @@ Claude は `ask_human` ツールで質問を出したらターンを終え、TUI
 [ui]
 questions = "left"
 ```
+
+新しい質問が届いても、既定では herdr の通知を出さない。出したいときは同じファイルに書く。
+
+```toml
+[notify]
+toast = true
+```
