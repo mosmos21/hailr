@@ -2,6 +2,7 @@
 #[allow(dead_code)]
 mod broker;
 mod config;
+mod log;
 
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -33,7 +34,12 @@ async fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    eprintln!("hailr: listening on {}", path.display());
+    match paths::log_path("hailr.log").map(|p| log::init(&p)) {
+        Some(Ok(())) => {}
+        Some(Err(e)) => eprintln!("hailr: cannot open the log file; running without it: {e}"),
+        None => {}
+    }
+    tracing::info!("listening on {}", path.display());
 
     let broker = Broker::new();
     let mux = config.mux();
