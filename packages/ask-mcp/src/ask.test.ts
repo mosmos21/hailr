@@ -6,26 +6,21 @@ import * as z from "zod";
 import { type AskDeps, askHuman, askInput } from "./ask.ts";
 import { BrokerUnavailable, type Question, Rejected } from "./broker.ts";
 
-function deps(register: (q: Question) => Promise<void> = async () => {}) {
-  const registered: Question[] = [];
-  const calls: string[] = [];
+function deps(ask: (q: Question) => Promise<void> = async () => {}) {
+  const asked: Question[] = [];
   const value: AskDeps = {
-    broker: {
+    session: {
       clientId: "c1",
-      connect: async () => {
-        calls.push("connect");
-      },
-      register: async (q) => {
-        calls.push("register");
-        registered.push(q);
-        await register(q);
+      ask: async (q) => {
+        asked.push(q);
+        await ask(q);
       },
     },
     paneId: "w1:p1",
     now: () => 42,
     newId: () => "q1",
   };
-  return { value, registered, calls };
+  return { value, asked };
 }
 
 function fixture(name: string): Question {
@@ -37,7 +32,7 @@ test.each(["question-ask.json", "question-ask-minimal.json"])(
   "sends what the protocol fixture %s shows",
   async (name) => {
     const expected = fixture(name);
-    const { value, registered, calls } = deps();
+    const { value, asked } = deps();
     const { title, question, options, links } = expected.body;
     const input = {
       title,
@@ -45,55 +40,28 @@ test.each(["question-ask.json", "question-ask-minimal.json"])(
       ...(options.length > 0 && { options }),
       ...(links.length > 0 && { links }),
     };
-    await askHuman(input, {
+    const text = await askHuman(input, {
       ...value,
-      broker: value.broker && { ...value.broker, clientId: expected.clientId },
+      session: value.session && { ...value.session, clientId: expected.clientId },
       paneId: expected.paneId,
       now: () => expected.askedAt,
       newId: () => expected.id,
     });
-    expect(registered).toEqual([expected]);
-    expect(calls).toEqual(["connect", "register"]);
+    expect(asked).toEqual([expected]);
+    expect(text).toContain(expected.id);
   },
 );
-
-test("registers the question for this pane and returns its ID", async () => {
-  const { value, registered } = deps();
-  const text = await askHuman({ title: "Merge?", question: "Merge #1?", options: ["Yes"] }, value);
-  expect(text).toContain("q1");
-  expect(registered).toEqual([
-    {
-      id: "q1",
-      clientId: "c1",
-      paneId: "w1:p1",
-      askedAt: 42,
-      body: { kind: "ask", title: "Merge?", question: "Merge #1?", options: ["Yes"], links: [] },
-    },
-  ]);
-});
 
 test("explains why it cannot ask", async () => {
   const input = { title: "t", question: "q" };
   for (const paneId of [undefined, "", "-x"]) {
     await expect(askHuman(input, { ...deps().value, paneId })).rejects.toThrow("herdr pane");
   }
-  await expect(askHuman(input, { ...deps().value, broker: undefined })).rejects.toThrow("socket");
+  await expect(askHuman(input, { ...deps().value, session: undefined })).rejects.toThrow("socket");
   const down = deps(async () => {
     throw new BrokerUnavailable("ENOENT");
   });
   await expect(askHuman(input, down.value)).rejects.toThrow("hailr is not running");
-  const unreachable = deps();
-  const broker = unreachable.value.broker;
-  const failing = broker && {
-    ...broker,
-    connect: async () => {
-      throw new BrokerUnavailable("ENOENT");
-    },
-  };
-  await expect(askHuman(input, { ...unreachable.value, broker: failing })).rejects.toThrow(
-    "hailr is not running",
-  );
-  expect(unreachable.registered).toEqual([]);
   const refused = deps(async () => {
     throw new Rejected("too many links");
   });

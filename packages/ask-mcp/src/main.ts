@@ -5,16 +5,22 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 
 import { askHuman, askInput, description } from "./ask.ts";
 import { Broker } from "./broker.ts";
+import { channelCapabilities, channelNotification } from "./channel.ts";
 import { socketPath } from "./paths.ts";
+import { Session } from "./session.ts";
 
+const server = new McpServer({ name: "hailr", version: "0.1.0" }, { capabilities: channelCapabilities });
 const socket = socketPath(process.env);
-const broker = socket ? new Broker(socket, randomUUID()) : undefined;
-const server = new McpServer({ name: "hailr", version: "0.1.0" });
+const session = socket
+  ? new Session(new Broker(socket, randomUUID()), (content, meta) =>
+      server.server.notification(channelNotification(content, meta)),
+    )
+  : undefined;
 
 server.registerTool("ask_human", { description, inputSchema: askInput }, async (input) => {
   try {
     const text = await askHuman(input, {
-      broker,
+      session,
       paneId: process.env.HERDR_PANE_ID,
       now: Date.now,
       newId: randomUUID,
@@ -29,6 +35,6 @@ server.registerTool("ask_human", { description, inputSchema: askInput }, async (
 await server.connect(new StdioServerTransport());
 // SSE の接続が残ると、Claude Code が stdin を閉じてもプロセスが終わらないため切る
 process.stdin.once("end", () => {
-  broker?.close();
+  session?.close();
   void server.close();
 });

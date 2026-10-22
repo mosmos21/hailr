@@ -1,6 +1,7 @@
 import * as z from "zod";
 
-import { type Broker, BrokerUnavailable, Rejected } from "./broker.ts";
+import { BrokerUnavailable, Rejected } from "./broker.ts";
+import type { Session } from "./session.ts";
 
 const text = z.string().refine((s) => s.trim() !== "", "must not be empty");
 
@@ -24,7 +25,7 @@ export const askInput = {
 export type AskInput = z.infer<z.ZodObject<typeof askInput>>;
 
 export type AskDeps = {
-  broker: Pick<Broker, "connect" | "register" | "clientId"> | undefined;
+  session: Pick<Session, "ask" | "clientId"> | undefined;
   paneId: string | undefined;
   now: () => number;
   newId: () => string;
@@ -38,19 +39,18 @@ export const description = [
 
 /** 登録できたら Claude に返す文、できなければ理由を投げる */
 export async function askHuman(input: AskInput, deps: AskDeps): Promise<string> {
-  const { broker, paneId } = deps;
+  const { session, paneId } = deps;
   if (!paneId || paneId.startsWith("-")) {
     throw new Error("ask_human works only inside a herdr pane; ask in the pane instead");
   }
-  if (!broker) {
+  if (!session) {
     throw new Error("cannot find the hailr socket (HOME is not set); ask in the pane instead");
   }
   const id = deps.newId();
   try {
-    await broker.connect();
-    await broker.register({
+    await session.ask({
       id,
-      clientId: broker.clientId,
+      clientId: session.clientId,
       paneId,
       askedAt: deps.now(),
       body: {
