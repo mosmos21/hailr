@@ -823,6 +823,32 @@ mod tests {
     }
 
     #[test]
+    fn answers_a_question_that_arrives_after_the_list_emptied() {
+        let broker = Broker::new();
+        let client = ClientId(Uuid::new_v4());
+        let (mut events, _guard) = broker.connect(client);
+        let first = ask(client, &["Yes"]);
+        broker.register(first).unwrap();
+        let mut app = App::default();
+        app.set_questions(broker.snapshot());
+        app.set_shown_buttons(9);
+
+        apply(&mut app, &broker, Action::Answer(0));
+        assert!(events.try_recv().is_ok());
+        wait_out(&mut app, &broker);
+        let next = ask(client, &["Allow"]);
+        broker.register(next.clone()).unwrap();
+        app.set_questions(broker.snapshot());
+        apply(&mut app, &broker, Action::Answer(0));
+        let answered = ClientEvent::Answered {
+            id: next.id,
+            answer: "Allow".into(),
+        };
+        assert_eq!(events.try_recv().ok(), Some(answered));
+        assert_eq!(app.notice(), None);
+    }
+
+    #[test]
     fn tells_when_the_answer_could_not_be_delivered_until_the_next_key() {
         let broker = Broker::new();
         let client = ClientId(Uuid::new_v4());
