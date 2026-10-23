@@ -23,7 +23,7 @@ use input::{Action, Typing};
 /// 押したボタンが効いたと見て取れるだけ、答えた質問を残す既定の長さ
 pub const ANSWERED_FOR: Duration = Duration::from_millis(1500);
 
-/// 選択が勝手に移ったあと、押しっぱなしのキーを次の質問に効かせない長さ
+/// 選択が勝手に移ったときや `o` でリンクを開いたあと、押しっぱなしのキーを効かせない長さ
 pub const MOVE_GUARD: Duration = Duration::from_secs(1);
 
 /// 端末を代替画面に切り替えて質問を出す。q / Ctrl-C、`stop`、入力が閉じたときに戻して終わる
@@ -171,7 +171,10 @@ fn apply(app: &mut App, broker: &Broker, action: Action) -> Option<Effect> {
         match action {
             Action::Answer(link) if link < app.shown_links() => {
                 let url = app.selected()?.body.links().get(link)?.clone();
-                return app.mark_opened(link).then_some(Effect::Open(url));
+                app.end_opening();
+                // 開いた番号のキーリピートが回答にならないよう、選択が移ったときと同じく少しの間答えさせない
+                app.hold_move();
+                return Some(Effect::Open(url));
             }
             Action::Answer(_) | Action::Open => return None,
             // クリックは押した先がはっきりしているので、待ちを終えてそのまま行う
@@ -1040,29 +1043,25 @@ mod tests {
             apply(&mut app, &broker, Action::Answer(1)),
             open("https://b.example/")
         );
+        assert!(!app.opening(), "opening a link ends the wait");
         assert_eq!(
             apply(&mut app, &broker, Action::Answer(1)),
             None,
             "held down"
         );
+        assert!(events.try_recv().is_err(), "the held digit does not answer");
+        app.settle_move();
+        apply(&mut app, &broker, Action::Open);
         assert_eq!(
             apply(&mut app, &broker, Action::Open),
             None,
             "o keeps waiting"
         );
         assert_eq!(
-            apply(&mut app, &broker, Action::Answer(1)),
-            None,
-            "o 2 o 2 opens once"
-        );
-        assert_eq!(
             apply(&mut app, &broker, Action::Answer(0)),
             open("https://a.example/")
         );
-        assert_eq!(
-            apply(&mut app, &broker, Action::Answer(1)),
-            open("https://b.example/")
-        );
+        apply(&mut app, &broker, Action::Open);
         app.set_shown_links(1);
         assert_eq!(
             apply(&mut app, &broker, Action::Answer(1)),
@@ -1097,6 +1096,23 @@ mod tests {
         app.set_shown_links(0);
         apply(&mut app, &broker, Action::Open);
         assert!(!app.opening(), "nothing to open");
+
+        app.settle_move();
+        app.set_shown_links(2);
+        apply(&mut app, &broker, Action::Open);
+        assert_eq!(
+            apply(&mut app, &broker, Action::Answer(1)),
+            open("https://b.example/")
+        );
+        assert_eq!(apply(&mut app, &broker, Action::Answer(1)), None);
+        assert!(events.try_recv().is_err(), "held after opening");
+        app.settle_move();
+        apply(&mut app, &broker, Action::Answer(1));
+        let answered = events.try_recv().unwrap();
+        assert!(
+            matches!(&answered, ClientEvent::Answered { answer, .. } if answer == "No"),
+            "a digit answers once the guard is over: {answered:?}"
+        );
     }
 
     #[test]
