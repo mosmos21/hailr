@@ -27,7 +27,7 @@ pub struct App {
     selected: Option<QuestionId>,
     shot: Option<Shot>,
     notice: Option<String>,
-    /// 選んでいた質問が消えてから、人がまだ選び直していない。一覧が空を挟んでも消さない
+    /// 選んでいた質問が消えてから、人がまだ選び直していない。返事を打っていなければ、一覧が空になったら消す
     moved: bool,
     /// 直前の描画で見えていたボタンの数。見えていない番号では答えさせない
     shown_buttons: Cell<usize>,
@@ -94,6 +94,10 @@ impl App {
                 self.end_opening();
             }
             self.selected = last.map(|last| self.questions[position.min(last)].id);
+        }
+        // 返事の枠は聞き直された同じ質問にも打ち続けたキーを渡さないよう、Esc まで印を残す
+        if self.questions.is_empty() && self.replying.is_none() {
+            self.moved = false;
         }
     }
 
@@ -227,6 +231,9 @@ impl App {
     }
 
     pub fn take_reply(&mut self) -> Option<(QuestionId, String)> {
+        if self.questions.is_empty() {
+            self.moved = false;
+        }
         self.replying.take().map(|r| (r.id, r.text))
     }
 
@@ -404,8 +411,26 @@ mod tests {
         app.set_questions(vec![]);
         app.set_questions(vec![a.clone()]);
         assert!(
+            !app.moved_on_its_own(),
+            "a question after an empty list is not a move"
+        );
+
+        app.start_reply();
+        app.set_questions(vec![]);
+        app.take_reply();
+        app.set_questions(vec![b.clone()]);
+        assert!(
+            !app.moved_on_its_own(),
+            "closing the reply box on an empty list is not a move either"
+        );
+
+        app.start_reply();
+        app.set_questions(vec![]);
+        app.set_questions(vec![a]);
+        app.take_reply();
+        assert!(
             app.moved_on_its_own(),
-            "an empty list in between keeps the mark"
+            "a question that arrived behind the reply box is not chosen yet"
         );
     }
 
