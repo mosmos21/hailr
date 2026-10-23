@@ -31,10 +31,8 @@ pub struct App {
     moved_at: Option<Instant>,
     /// 直前の描画で見えていたボタンの数。見えていない番号では答えさせない
     shown_buttons: Cell<usize>,
-    /// `o` を押し、開くリンクの番号を待っている。数字と `o` 以外のキーで消す
+    /// `o` を押し、開くリンクの番号を待っている。リンクを開くか、数字と `o` 以外のキーで消す
     opening: bool,
-    /// 待ちの中で直前に開いたリンク。押しっぱなしで同じリンクを何度も開かない
-    opened: Option<usize>,
     shown_links: Cell<usize>,
     /// 直前の描画でクリックできた場所
     targets: RefCell<Vec<(Rect, Target)>>,
@@ -300,7 +298,6 @@ impl App {
 
     pub fn start_opening(&mut self) {
         self.opening = true;
-        self.opened = None;
     }
 
     pub fn opening(&self) -> bool {
@@ -309,12 +306,6 @@ impl App {
 
     pub fn end_opening(&mut self) {
         self.opening = false;
-        self.opened = None;
-    }
-
-    /// 同じ待ちの中で直前に開いたリンクなら false
-    pub fn mark_opened(&mut self, link: usize) -> bool {
-        self.opened.replace(link) != Some(link)
     }
 
     /// 人がクリックで選んだ。移ったばかりの扱いを解く
