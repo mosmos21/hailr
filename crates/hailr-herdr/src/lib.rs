@@ -9,17 +9,30 @@ use hailr_core::protocol::PaneId;
 
 const TIMEOUT: Duration = Duration::from_secs(2);
 
+// Ghostty が動いていないときに起動させないよう、動いているときだけ herdr の terminal を前に出す
+const RAISE_HERDR: &str = r#"if application "Ghostty" is running then
+    tell application "Ghostty" to focus (first terminal whose name is "herdr")
+end if"#;
+
 pub struct HerdrMux {
     bin: PathBuf,
+    osascript: Option<PathBuf>,
 }
 
 impl HerdrMux {
     pub fn new() -> Self {
-        Self::with_bin("herdr")
+        Self {
+            osascript: cfg!(target_os = "macos").then(|| "/usr/bin/osascript".into()),
+            ..Self::with_bin("herdr")
+        }
     }
 
+    /// herdr の場所だけを差し替える。ウィンドウを前に出す osascript は呼ばない
     pub fn with_bin(bin: impl Into<PathBuf>) -> Self {
-        Self { bin: bin.into() }
+        Self {
+            bin: bin.into(),
+            osascript: None,
+        }
     }
 }
 
@@ -49,7 +62,12 @@ impl Mux for HerdrMux {
 
     fn focus(&self, pane: &PaneId) -> Result<(), MuxError> {
         let pane = checked(pane)?;
-        cmd::run(&self.bin, "agent focus", &["agent", "focus", pane], TIMEOUT).map(|_| ())
+        cmd::run(&self.bin, "agent focus", &["agent", "focus", pane], TIMEOUT)?;
+        // herdr の中では切り替わっているため、前に出せなくても成功として返す
+        if let Some(osascript) = &self.osascript {
+            let _ = cmd::run(osascript, "raise herdr", &["-e", RAISE_HERDR], TIMEOUT);
+        }
+        Ok(())
     }
 
     fn notify(&self, title: &str, body: &str) -> Result<(), MuxError> {
@@ -102,7 +120,11 @@ mod tests {
         }
 
         fn mux(&self) -> HerdrMux {
-            HerdrMux::with_bin(self.dir.join("herdr"))
+            HerdrMux::with_bin(self.bin())
+        }
+
+        fn bin(&self) -> PathBuf {
+            self.dir.join("herdr")
         }
 
         fn args(&self) -> Vec<String> {
@@ -186,5 +208,37 @@ mod tests {
             ["agent", "focus", "w1B:p1"],
             "not called again"
         );
+    }
+
+    #[test]
+    fn brings_the_herdr_window_forward_after_focusing() {
+        let herdr = Stub::new("raise-herdr", "{}");
+        let osascript = Stub::new("raise-osascript", "");
+        let mux = HerdrMux {
+            osascript: Some(osascript.bin()),
+            ..herdr.mux()
+        };
+        mux.focus(&pane("w1B:p1")).unwrap();
+        assert_eq!(herdr.args(), ["agent", "focus", "w1B:p1"]);
+        let script: Vec<String> = RAISE_HERDR.lines().map(str::to_owned).collect();
+        assert_eq!(osascript.args(), [vec!["-e".to_owned()], script].concat());
+
+        let mux = HerdrMux {
+            osascript: Some(osascript.dir.join("missing")),
+            ..herdr.mux()
+        };
+        assert!(mux.focus(&pane("w1B:p1")).is_ok(), "focused even so");
+        assert!(HerdrMux::with_bin("herdr").osascript.is_none());
+    }
+
+    #[test]
+    fn leaves_the_window_alone_when_focus_fails() {
+        let osascript = Stub::new("unfocused-osascript", "");
+        let mux = HerdrMux {
+            osascript: Some(osascript.bin()),
+            ..HerdrMux::with_bin(osascript.dir.join("missing"))
+        };
+        assert!(mux.focus(&pane("w1B:p1")).is_err());
+        assert!(!osascript.dir.join("args").exists());
     }
 }
