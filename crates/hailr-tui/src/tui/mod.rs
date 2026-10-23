@@ -23,6 +23,9 @@ use input::{Action, Typing};
 /// 押したボタンが効いたと見て取れるだけ、答えた質問を残す既定の長さ
 pub const ANSWERED_FOR: Duration = Duration::from_millis(1500);
 
+/// 選択が勝手に移ったあと、押しっぱなしのキーを次の質問に効かせない長さ
+pub const MOVE_GUARD: Duration = Duration::from_secs(1);
+
 /// 端末を代替画面に切り替えて質問を出す。q / Ctrl-C、`stop`、入力が閉じたときに戻して終わる
 pub async fn run(
     broker: Arc<Broker>,
@@ -188,18 +191,18 @@ fn apply(app: &mut App, broker: &Broker, action: Action) -> Option<Effect> {
             | Action::Reply
             | Action::Click(Target::Button(_) | Target::Link(_))
     );
-    if acts && app.selected().is_none() {
-        return None;
-    }
-    // 答えた直後の押し直しやキーリピートが、見ていない次の質問（権限確認を含む）に届かないようにする
-    if acts && app.moved_on_its_own() {
-        app.set_notice("the selection moved; press ↑ or ↓ to pick a question first");
-        return None;
-    }
     let settling = matches!(
         action,
         Action::Answer(_) | Action::Delete | Action::Reply | Action::Click(Target::Button(_))
     );
+    // 一覧が空の間も含め、押し続けたキーが移った先の質問（権限確認を含む）に届かないよう、測り直して捨てる
+    if settling && app.just_moved() {
+        app.hold_move();
+        return None;
+    }
+    if acts && app.selected().is_none() {
+        return None;
+    }
     if settling && app.selected_is_answered() {
         return None;
     }
@@ -439,7 +442,7 @@ mod tests {
         assert_eq!(broker.snapshot(), vec![second.clone()]);
         assert_eq!(app.selected().map(|q| q.id), Some(first.id));
         assert_eq!(app.answered_with(first.id), Some(&Choice::Button(1)));
-        assert!(!app.moved_on_its_own());
+        assert!(!app.just_moved());
 
         for action in [
             Action::Delete,
@@ -464,7 +467,7 @@ mod tests {
 
         wait_out(&mut app, &broker);
         assert_eq!(app.selected().map(|q| q.id), Some(second.id));
-        assert!(app.moved_on_its_own());
+        assert!(app.just_moved());
     }
 
     #[test]
@@ -483,10 +486,7 @@ mod tests {
         broker.register(question.clone()).unwrap();
         app.set_questions(broker.snapshot());
         assert_eq!(app.answered_with(question.id), None);
-        assert!(
-            app.moved_on_its_own(),
-            "a held key must not answer it again"
-        );
+        assert!(app.just_moved(), "a held key must not answer it again");
         apply(&mut app, &broker, Action::Answer(0));
         assert!(events.try_recv().is_err());
 
@@ -511,7 +511,7 @@ mod tests {
         apply(&mut app, &broker, Action::Next);
         broker.register(first.clone()).unwrap();
         app.set_questions(broker.snapshot());
-        assert!(!app.moved_on_its_own());
+        assert!(!app.just_moved());
         assert_eq!(app.selected().map(|q| q.id), Some(second.id));
         apply(&mut app, &broker, Action::Answer(0));
         let answered = ClientEvent::Answered {
@@ -663,6 +663,10 @@ mod tests {
         type_into(&mut app, &broker, Typing::Text("draft".into()));
         type_into(&mut app, &broker, Typing::Cancel);
         assert_eq!(app.reply(), None);
+        assert!(
+            !app.just_moved(),
+            "closing a box with its question is no move"
+        );
         assert_eq!(broker.snapshot().len(), 1, "nothing sent");
 
         drop(events);
@@ -728,7 +732,7 @@ mod tests {
         };
         assert_eq!(events.try_recv().ok(), Some(answered));
         assert_eq!(app.answered_with(questions[1].id), None, "replaced");
-        assert!(!app.moved_on_its_own());
+        assert!(!app.just_moved());
 
         app.select_next();
         assert_eq!(app.selected().map(|q| q.id), Some(late.id));
@@ -738,7 +742,7 @@ mod tests {
             Some(late.id),
             "a choice stays"
         );
-        assert!(!app.moved_on_its_own());
+        assert!(!app.just_moved());
     }
 
     #[test]
@@ -783,11 +787,43 @@ mod tests {
             reason: WithdrawReason::Deleted,
         };
         assert_eq!(events.try_recv().unwrap(), withdrawn);
-        assert_eq!(broker.snapshot(), vec![first]);
+        assert_eq!(broker.snapshot(), vec![first.clone()]);
+        apply(&mut app, &broker, Action::Delete);
+        assert!(events.try_recv().is_err(), "a held d stops at the next one");
+        assert_eq!(broker.snapshot(), vec![first.clone()]);
+        app.settle_move();
+        apply(&mut app, &broker, Action::Delete);
+        assert!(broker.snapshot().is_empty());
     }
 
     #[test]
-    fn waits_for_a_choice_after_the_selection_moved_on_its_own() {
+    fn keeps_ignoring_a_key_held_past_the_guard() {
+        let broker = Broker::new();
+        let client = ClientId(Uuid::new_v4());
+        let (mut events, _guard) = broker.connect(client);
+        let first = ask(client, &["Yes"]);
+        let mut next = ask(client, &["Allow"]);
+        next.asked_at = 2;
+        for q in [&first, &next] {
+            broker.register(q.clone()).unwrap();
+        }
+        let mut app = App::default();
+        app.set_questions(broker.snapshot());
+        app.set_shown_buttons(9);
+
+        apply(&mut app, &broker, Action::Answer(0));
+        assert!(events.try_recv().is_ok());
+        wait_out(&mut app, &broker);
+        app.age_move(MOVE_GUARD / 2 + Duration::from_millis(100));
+        apply(&mut app, &broker, Action::Answer(0));
+        app.age_move(MOVE_GUARD / 2 + Duration::from_millis(100));
+        assert!(app.just_moved(), "a repeat restarts the guard");
+        apply(&mut app, &broker, Action::Answer(0));
+        assert!(events.try_recv().is_err());
+    }
+
+    #[test]
+    fn ignores_held_keys_just_after_the_selection_moved() {
         let broker = Broker::new();
         let client = ClientId(Uuid::new_v4());
         let (mut events, _guard) = broker.connect(client);
@@ -815,11 +851,42 @@ mod tests {
                 events.try_recv().is_err(),
                 "nothing sent to the next question"
             );
-            assert!(app.notice().unwrap().contains("pick a question first"));
+            assert_eq!(app.notice(), None);
         }
-        apply(&mut app, &broker, Action::Previous);
+        assert!(app.reply().is_none());
+        assert_eq!(broker.snapshot(), vec![next.clone()], "not deleted");
+        app.settle_move();
+        apply(&mut app, &broker, Action::Answer(0));
+        let answered = ClientEvent::Answered {
+            id: next.id,
+            answer: "Allow".into(),
+        };
+        assert_eq!(events.try_recv().ok(), Some(answered));
+    }
+
+    #[test]
+    fn answers_at_once_a_question_that_arrives_after_the_guard() {
+        let broker = Broker::new();
+        let client = ClientId(Uuid::new_v4());
+        let (mut events, _guard) = broker.connect(client);
+        broker.register(ask(client, &["Yes"])).unwrap();
+        let mut app = App::default();
+        app.set_questions(broker.snapshot());
+        app.set_shown_buttons(9);
+
         apply(&mut app, &broker, Action::Answer(0));
         assert!(events.try_recv().is_ok());
+        wait_out(&mut app, &broker);
+        app.settle_move();
+        let next = ask(client, &["Allow"]);
+        broker.register(next.clone()).unwrap();
+        app.set_questions(broker.snapshot());
+        apply(&mut app, &broker, Action::Answer(0));
+        let answered = ClientEvent::Answered {
+            id: next.id,
+            answer: "Allow".into(),
+        };
+        assert_eq!(events.try_recv().ok(), Some(answered));
     }
 
     #[test]
@@ -836,9 +903,18 @@ mod tests {
         apply(&mut app, &broker, Action::Answer(0));
         assert!(events.try_recv().is_ok());
         wait_out(&mut app, &broker);
+        app.age_move(MOVE_GUARD / 2 + Duration::from_millis(100));
+        apply(&mut app, &broker, Action::Answer(0));
+        app.age_move(MOVE_GUARD / 2 + Duration::from_millis(100));
         let next = ask(client, &["Allow"]);
         broker.register(next.clone()).unwrap();
         app.set_questions(broker.snapshot());
+        apply(&mut app, &broker, Action::Answer(0));
+        assert!(
+            events.try_recv().is_err(),
+            "a key held over the empty list keeps the guard"
+        );
+        app.settle_move();
         apply(&mut app, &broker, Action::Answer(0));
         let answered = ClientEvent::Answered {
             id: next.id,
@@ -889,8 +965,9 @@ mod tests {
         assert_eq!(apply(&mut app, &broker, Action::Focus), target, "answered");
 
         wait_out(&mut app, &broker);
-        assert_eq!(apply(&mut app, &broker, Action::Focus), None, "moved");
-        assert!(app.notice().unwrap().contains("pick a question first"));
+        assert!(app.just_moved());
+        let moved = Some(Effect::Focus(first.id, first.pane_id.clone()));
+        assert_eq!(apply(&mut app, &broker, Action::Focus), moved, "moved");
     }
 
     #[test]
@@ -1023,7 +1100,7 @@ mod tests {
     }
 
     #[test]
-    fn waits_for_a_choice_before_opening_after_the_selection_moved() {
+    fn ends_the_wait_for_a_link_when_the_selection_moves() {
         let broker = Broker::new();
         let client = ClientId(Uuid::new_v4());
         let (_events, _guard) = broker.connect(client);
@@ -1055,10 +1132,12 @@ mod tests {
         // 開く待ちのまま、選んでいた質問が取り下げられた
         broker.withdraw(&app.selected().unwrap().id, WithdrawReason::Deleted);
         app.set_questions(broker.snapshot());
+        assert!(app.just_moved());
         assert!(!app.opening(), "the wait ends with the question");
         apply(&mut app, &broker, Action::Open);
-        assert!(!app.opening(), "moved");
-        assert!(app.notice().unwrap().contains("pick a question first"));
+        assert!(app.opening(), "links of the question it moved to");
+        let opened = apply(&mut app, &broker, Action::Answer(0));
+        assert_eq!(opened, Some(Effect::Open("https://a.example/".into())));
     }
 
     #[test]
@@ -1110,13 +1189,16 @@ mod tests {
         assert_eq!(events.try_recv().unwrap(), answered, "and answers");
 
         wait_out(&mut app, &broker);
-        assert!(app.moved_on_its_own());
+        assert!(app.just_moved());
         apply(&mut app, &broker, click(Target::Button(0)));
-        assert!(events.try_recv().is_err(), "not after the selection moved");
+        assert!(
+            events.try_recv().is_err(),
+            "not just after the selection moved"
+        );
         let link = apply(&mut app, &broker, click(Target::Link(0)));
-        assert_eq!(link, None, "no link either");
+        assert_eq!(link, Some(Effect::Open("https://a.example/".into())));
         apply(&mut app, &broker, click(Target::Question(first.id)));
-        assert!(!app.moved_on_its_own(), "a click on the list is a choice");
+        assert!(!app.just_moved(), "a click on the list is a choice");
         apply(&mut app, &broker, click(Target::Button(0)));
         assert!(events.try_recv().is_ok());
     }
