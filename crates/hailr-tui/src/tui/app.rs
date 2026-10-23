@@ -27,8 +27,8 @@ pub struct App {
     selected: Option<QuestionId>,
     shot: Option<Shot>,
     notice: Option<String>,
-    /// 選んでいた質問が消えてから、人がまだ選び直していない。返事を打っていなければ、一覧が空になったら消す
-    moved: bool,
+    /// ガードを数え始める時刻。キーを捨てるたびに測り直し、人が選び直したら消す
+    moved_at: Option<Instant>,
     /// 直前の描画で見えていたボタンの数。見えていない番号では答えさせない
     shown_buttons: Cell<usize>,
     /// `o` を押し、開くリンクの番号を待っている。数字と `o` 以外のキーで消す
@@ -46,6 +46,8 @@ pub struct App {
 struct Replying {
     id: QuestionId,
     text: String,
+    /// 返事先が一覧から一度消えた。聞き直されても戻さない
+    gone: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -70,9 +72,9 @@ impl App {
         if let Some(answered) = &self.answered
             && questions.iter().any(|q| q.id == answered.question.id)
         {
-            // 押した数字のキーリピートが聞き直された質問に届かないよう、選び直すまで答えさせない
+            // 押した数字のキーリピートが聞き直された質問に届かないよう、移ったときと同じく少しの間答えさせない
             if self.selected == Some(answered.question.id) {
-                self.moved = true;
+                self.moved_at = Some(Instant::now());
             }
             self.answered = None;
         }
@@ -87,17 +89,18 @@ impl App {
             questions.insert(at, answered.question.clone());
         }
         self.questions = questions;
+        if let Some(replying) = self.replying.as_mut()
+            && !self.questions.iter().any(|q| q.id == replying.id)
+        {
+            replying.gone = true;
+        }
         if self.selected_index().is_none() {
             let last = self.questions.len().checked_sub(1);
             if self.selected.is_some() {
-                self.moved = true;
+                self.moved_at = Some(Instant::now());
                 self.end_opening();
             }
             self.selected = last.map(|last| self.questions[position.min(last)].id);
-        }
-        // 返事の枠は聞き直された同じ質問にも打ち続けたキーを渡さないよう、Esc まで印を残す
-        if self.questions.is_empty() && self.replying.is_none() {
-            self.moved = false;
         }
     }
 
@@ -189,6 +192,7 @@ impl App {
             self.replying = Some(Replying {
                 id: question.id,
                 text: String::new(),
+                gone: false,
             });
         }
     }
@@ -197,11 +201,11 @@ impl App {
         self.replying.as_ref().map(|r| (r.id, r.text.as_str()))
     }
 
-    /// 返事先が選択から外れたり選択が勝手に戻ったりしても、打ち続けたキーがコマンドとして効かないよう Esc まで枠を閉じない
+    /// 返事先が選択から外れたり聞き直されたりしても、打ち続けたキーがコマンドとして効かないよう Esc まで枠を閉じない
     pub fn reply_gone(&self) -> bool {
         self.replying
             .as_ref()
-            .is_some_and(|r| self.moved || self.selected().is_none_or(|q| q.id != r.id))
+            .is_some_and(|r| r.gone || self.selected().is_none_or(|q| q.id != r.id))
     }
 
     /// 改行やタブで 1 行の枠が崩れないよう、制御文字は空白にして足す。上限を超える分は捨てて知らせる
@@ -231,8 +235,9 @@ impl App {
     }
 
     pub fn take_reply(&mut self) -> Option<(QuestionId, String)> {
-        if self.questions.is_empty() {
-            self.moved = false;
+        // 止めていた枠を閉じた直後の数字が、その間に移った先の質問へ届かないよう測り直す
+        if self.reply_gone() {
+            self.moved_at = Some(Instant::now());
         }
         self.replying.take().map(|r| (r.id, r.text))
     }
@@ -254,9 +259,27 @@ impl App {
             .is_some_and(|q| self.answered_with(q.id).is_some())
     }
 
-    /// 一覧が変わって選択が移ったまま、人がまだ選び直していない
-    pub fn moved_on_its_own(&self) -> bool {
-        self.moved
+    /// ガードを数え始めてから MOVE_GUARD が過ぎていない
+    pub fn just_moved(&self) -> bool {
+        self.moved_at
+            .is_some_and(|at| at.elapsed() < super::MOVE_GUARD)
+    }
+
+    /// 押しっぱなしのキーが続く間はガードを延ばす
+    pub fn hold_move(&mut self) {
+        self.moved_at = Some(Instant::now());
+    }
+
+    #[cfg(test)]
+    pub fn settle_move(&mut self) {
+        self.age_move(super::MOVE_GUARD);
+    }
+
+    #[cfg(test)]
+    pub fn age_move(&mut self, by: std::time::Duration) {
+        self.moved_at = self
+            .moved_at
+            .map(|at| at.checked_sub(by).expect("an instant a guard ago"));
     }
 
     pub fn set_shown_buttons(&self, count: usize) {
@@ -294,11 +317,11 @@ impl App {
         self.opened.replace(link) != Some(link)
     }
 
-    /// 人がクリックで選んだ。選び直し待ちを解く
+    /// 人がクリックで選んだ。移ったばかりの扱いを解く
     pub fn select(&mut self, id: QuestionId) {
         if self.questions.iter().any(|q| q.id == id) {
             self.selected = Some(id);
-            self.moved = false;
+            self.moved_at = None;
         }
     }
 
@@ -323,7 +346,7 @@ impl App {
         let Some(current) = self.selected_index() else {
             return;
         };
-        self.moved = false;
+        self.moved_at = None;
         let next = step(current).min(self.questions.len() - 1);
         self.selected = Some(self.questions[next].id);
     }
@@ -396,42 +419,39 @@ mod tests {
     }
 
     #[test]
-    fn marks_a_selection_that_moved_until_the_person_chooses() {
+    fn marks_a_selection_that_moved_until_the_person_chooses_or_it_settles() {
         let mut app = App::default();
         let [a, b] = [question("a"), question("b")];
         app.set_questions(vec![a.clone()]);
-        assert!(!app.moved_on_its_own(), "the first selection is not a move");
+        assert!(!app.just_moved(), "the first selection is not a move");
         app.set_questions(vec![a.clone(), b.clone()]);
-        assert!(!app.moved_on_its_own(), "kept");
+        assert!(!app.just_moved(), "kept");
         app.set_questions(vec![b.clone()]);
-        assert!(app.moved_on_its_own());
+        assert!(app.just_moved());
         app.select_previous();
-        assert!(!app.moved_on_its_own());
+        assert!(!app.just_moved());
 
-        app.set_questions(vec![]);
         app.set_questions(vec![a.clone()]);
-        assert!(
-            !app.moved_on_its_own(),
-            "a question after an empty list is not a move"
-        );
+        assert!(app.just_moved());
+        app.settle_move();
+        assert!(!app.just_moved());
+    }
 
+    #[test]
+    fn keeps_the_reply_box_stopped_after_its_question_was_asked_again() {
+        let mut app = App::default();
+        let [a, b] = [question("a"), question("b")];
+        app.set_questions(vec![a.clone()]);
         app.start_reply();
         app.set_questions(vec![]);
+        app.set_questions(vec![a.clone(), b]);
+        assert_eq!(app.selected().map(|q| q.id), Some(a.id));
+        assert!(app.reply_gone(), "asked again, it still waits for Esc");
+        app.settle_move();
         app.take_reply();
-        app.set_questions(vec![b.clone()]);
-        assert!(
-            !app.moved_on_its_own(),
-            "closing the reply box on an empty list is not a move either"
-        );
-
+        assert!(app.just_moved(), "keys right after Esc are held back");
         app.start_reply();
-        app.set_questions(vec![]);
-        app.set_questions(vec![a]);
-        app.take_reply();
-        assert!(
-            app.moved_on_its_own(),
-            "a question that arrived behind the reply box is not chosen yet"
-        );
+        assert!(!app.reply_gone(), "a new box starts fresh");
     }
 
     #[test]

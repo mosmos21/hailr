@@ -55,9 +55,6 @@ fn keys(app: &App) -> String {
     if app.selected().is_none() {
         return " q quit".into();
     }
-    if app.moved_on_its_own() {
-        return " ↑↓ select  q quit".into();
-    }
     if app.opening() {
         return match app.shown_links() {
             0 => " no links on screen  any other key cancels".into(),
@@ -769,11 +766,12 @@ mod tests {
         );
 
         app.set_questions(vec![with_options(&["Yes"])]);
+        assert!(app.just_moved());
         let rows = render(&app, Side::Right, 80, 16);
         assert_eq!(
             rows[15].trim_end(),
-            " ↑↓ select  q quit",
-            "moved on its own"
+            " ↑↓ select  1 answer  r reply  f focus  d delete  q quit",
+            "the keys of the question it moved to"
         );
 
         let mut app = App::default();
