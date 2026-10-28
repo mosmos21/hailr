@@ -13,7 +13,7 @@ use hailr_core::paths;
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::oneshot;
 
-use broker::{Broker, notifier, poller, serve, socket};
+use broker::{Broker, notifier, serve, socket};
 use config::Config;
 
 #[tokio::main(flavor = "current_thread")]
@@ -53,7 +53,6 @@ async fn main() -> ExitCode {
             Arc::clone(&mux),
         ))
     });
-    let polling = tokio::spawn(poller::run(Arc::clone(&broker), Arc::clone(&mux)));
     let (quit_tx, quit_rx) = oneshot::channel::<()>();
     let quit = async {
         let _ = quit_rx.await;
@@ -74,7 +73,6 @@ async fn main() -> ExitCode {
         Some(result) => result,
         None => serving.await,
     };
-    polling.abort();
     if let Some(notifying) = notifying {
         notifying.abort();
     }
