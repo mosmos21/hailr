@@ -198,8 +198,8 @@ fn apply(app: &mut App, broker: &Broker, action: Action) -> Option<Effect> {
         action,
         Action::Answer(_) | Action::Delete | Action::Reply | Action::Click(Target::Button(_))
     );
-    // 一覧が空の間も含め、押し続けたキーが移った先の質問（権限確認を含む）に届かないよう、測り直して捨てる
-    if settling && app.just_moved() {
+    // 一覧が空の間も含め、押し続けたキーが移った先の質問（権限確認を含む）に届かないよう、測り直して捨てる。f も移した質問を消すので含める
+    if (settling || matches!(action, Action::Focus)) && app.just_moved() {
         app.hold_move();
         return None;
     }
@@ -333,10 +333,13 @@ fn send_reply(app: &mut App, broker: &Broker) {
     }
 }
 
-/// pane で答えたら取り下げられるよう、移せた質問にだけ印を付ける。遅れて届いた失敗で、あとから出た知らせを消さない
+/// 移せた質問は pane で答えるので一覧から消す。遅れて届いた失敗で、あとから出た知らせを消さない
 fn after_focus(app: &mut App, broker: &Broker, result: Result<QuestionId, String>) {
     match result {
-        Ok(id) => broker.mark_focused(&id),
+        Ok(id) => {
+            broker.withdraw(&id, WithdrawReason::AnsweredInPane);
+            app.set_questions(broker.snapshot());
+        }
         Err(e) if app.notice().is_none() => app.set_notice(e),
         Err(_) => {}
     }
@@ -387,7 +390,6 @@ impl Drop for AbortOnDrop {
 mod tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-    use hailr_core::mux::{AgentStatus, PaneInfo};
     use hailr_core::protocol::{ClientEvent, ClientId, Question, QuestionBody};
     use uuid::Uuid;
 
@@ -969,49 +971,70 @@ mod tests {
 
         wait_out(&mut app, &broker);
         assert!(app.just_moved());
+        assert_eq!(apply(&mut app, &broker, Action::Focus), None, "just moved");
+        app.settle_move();
         let moved = Some(Effect::Focus(first.id, first.pane_id.clone()));
         assert_eq!(apply(&mut app, &broker, Action::Focus), moved, "moved");
     }
 
     #[test]
-    fn marks_only_a_question_whose_pane_was_focused() {
+    fn withdraws_only_a_question_whose_pane_was_focused() {
         let broker = Broker::new();
-        let client = ClientId(Uuid::new_v4());
-        let (_events, _guard) = broker.connect(client);
-        let mut question = ask(client, &[]);
+        let (asker, other) = (ClientId(Uuid::new_v4()), ClientId(Uuid::new_v4()));
+        let (mut asked, _guard) = broker.connect(asker);
+        let (mut untouched, _other_guard) = broker.connect(other);
+        let mut question = ask(asker, &[]);
         question.body = QuestionBody::Permission {
             request_id: "abcde".into(),
             tool_name: "Bash".into(),
             description: "d".into(),
             input_preview: "p".into(),
         };
+        let mut rest = ask(other, &["Yes"]);
+        rest.asked_at = 2;
         broker.register(question.clone()).unwrap();
+        broker.register(rest.clone()).unwrap();
         let mut app = App::default();
         app.set_questions(broker.snapshot());
-        let pane = |status| PaneInfo {
-            id: question.pane_id.clone(),
-            status,
-            label: String::new(),
-        };
-        let answer_in_pane = |broker: &Broker| {
-            for status in [AgentStatus::Idle, AgentStatus::Working] {
-                broker.reconcile_panes(broker.listing_start(), &[pane(status)]);
-            }
-        };
 
         app.set_notice("not answered: later");
         after_focus(&mut app, &broker, Err("not focused on w1:p1: x".into()));
         assert_eq!(app.notice(), Some("not answered: later"), "kept");
-        answer_in_pane(&broker);
-        assert_eq!(broker.snapshot().len(), 1, "no mark without a focus");
+        assert_eq!(broker.snapshot().len(), 2, "kept without a focus");
 
         app.clear_notice();
         after_focus(&mut app, &broker, Err("not focused on w1:p1: x".into()));
         assert_eq!(app.notice(), Some("not focused on w1:p1: x"));
+        assert!(!app.just_moved());
         after_focus(&mut app, &broker, Ok(question.id));
         assert!(app.notice().is_some(), "a success leaves the notice");
-        answer_in_pane(&broker);
-        assert!(broker.snapshot().is_empty(), "answered in the pane");
+        assert!(app.just_moved());
+        assert_eq!(
+            asked.try_recv().unwrap(),
+            ClientEvent::Withdrawn {
+                id: question.id,
+                reason: WithdrawReason::AnsweredInPane,
+            }
+        );
+        assert_eq!(broker.snapshot(), vec![rest.clone()]);
+        assert!(untouched.try_recv().is_err(), "the other question stays");
+        assert_eq!(app.selected(), Some(&rest));
+        assert_eq!(
+            apply(&mut app, &broker, Action::Focus),
+            None,
+            "a repeated f stays off the next question"
+        );
+
+        after_focus(&mut app, &broker, Ok(rest.id));
+        assert_eq!(
+            untouched.try_recv().unwrap(),
+            ClientEvent::Withdrawn {
+                id: rest.id,
+                reason: WithdrawReason::AnsweredInPane,
+            },
+            "ask questions leave too"
+        );
+        assert!(app.selected().is_none());
     }
 
     fn with_links(client: ClientId, links: &[&str]) -> Question {

@@ -51,7 +51,7 @@ Run these from the repository root.
 | `1`–`9` | Answer with a button |
 | `o` then a digit | Open a link |
 | `r` | Type a reply (Enter sends, Esc cancels) |
-| `f` | Move herdr's view to that pane. If herdr is open in Ghostty, its window comes to the front. After moving, answering a permission prompt in the pane removes it from the list (questions from `ask_human` stay, so remove them with `d`) |
+| `f` | Move herdr's view to that pane. If herdr is open in Ghostty, its window comes to the front. The question leaves the list, since you answer it in the pane |
 | `d` | Remove a question. Claude is told you removed it without answering. For a permission prompt, nothing is sent and the terminal dialog stays |
 | `q` | Quit |
 

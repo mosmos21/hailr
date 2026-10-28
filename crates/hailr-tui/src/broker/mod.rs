@@ -1,7 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use hailr_core::mux::{AgentStatus, PaneInfo};
 use hailr_core::protocol::{
     ClientEvent, ClientId, MAX_LINKS, MAX_OPTIONS, Question, QuestionBody, QuestionId,
     WithdrawReason,
@@ -10,7 +9,6 @@ use tokio::sync::{broadcast, mpsc, watch};
 
 pub mod http;
 pub mod notifier;
-pub mod poller;
 pub mod serve;
 pub mod socket;
 
@@ -30,32 +28,12 @@ pub struct Broker {
 
 #[derive(Default)]
 struct State {
-    questions: HashMap<QuestionId, Entry>,
+    questions: HashMap<QuestionId, Question>,
     clients: HashMap<ClientId, Client>,
     next_connection: u64,
-    focuses: u64,
     /// つなぎ直した ask-mcp の再登録で鳴らし直さないよう、回答・取り下げまで覚えておく
     notified: HashSet<QuestionId>,
 }
-
-struct Entry {
-    question: Question,
-    focus: Focus,
-}
-
-/// TUI から herdr の画面を pane へ移したあと、pane が待ち（idle / blocked）を経て working になったら、人が pane で答えたとみなす
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Focus {
-    No,
-    /// focus したが、まだ待ちを見ていない。focus の前から別の作業で working のことがあるため。値は focus の通し番号
-    Marked(u64),
-    /// focus したあとに待ちを見た。次に working になったら答えたとみなす
-    Armed,
-}
-
-/// 一覧を取り始めた時点を表す。これより後の focus は、この一覧では進めない
-#[derive(Clone, Copy, Debug)]
-pub struct ListingStart(u64);
 
 struct Client {
     connection: u64,
@@ -127,7 +105,7 @@ impl Broker {
         // つなぎ直した ask-mcp は手元の未回答を全部登録し直すため、前の接続の写しは捨てる
         state
             .questions
-            .retain(|_, entry| entry.question.client_id != client);
+            .retain(|_, question| question.client_id != client);
         // 同じ client が切断に気づく前につなぎ直すことがあるため、古い接続の後始末が新しい接続を消さないよう世代で区別する
         state.clients.insert(
             client,
@@ -153,11 +131,11 @@ impl Broker {
             return Err(RegisterError::NoClient);
         }
         let registered = match state.questions.get_mut(&question.id) {
-            Some(entry) if entry.question.client_id != question.client_id => {
+            Some(held) if held.client_id != question.client_id => {
                 return Err(RegisterError::NotOwner);
             }
-            Some(entry) => {
-                entry.question = question;
+            Some(held) => {
+                *held = question;
                 Registered::Updated
             }
             None => {
@@ -165,13 +143,7 @@ impl Broker {
                     // 受け手が居ないときは知らせる相手が居ないだけなので、送れなくても捨てる
                     let _ = self.arrivals.send(question.id);
                 }
-                state.questions.insert(
-                    question.id,
-                    Entry {
-                        question,
-                        focus: Focus::No,
-                    },
-                );
+                state.questions.insert(question.id, question);
                 Registered::New
             }
         };
@@ -182,12 +154,7 @@ impl Broker {
 
     /// 未回答の質問を古い順に返す
     pub fn snapshot(&self) -> Vec<Question> {
-        let mut questions: Vec<_> = self
-            .lock()
-            .questions
-            .values()
-            .map(|entry| entry.question.clone())
-            .collect();
+        let mut questions: Vec<_> = self.lock().questions.values().cloned().collect();
         questions.sort_by_key(|q| (q.asked_at, q.id));
         questions
     }
@@ -224,11 +191,7 @@ impl Broker {
         check: impl FnOnce(&Question, &str) -> Result<(), AnswerError>,
     ) -> Result<(), AnswerError> {
         let mut state = self.lock();
-        let question = &state
-            .questions
-            .get(id)
-            .ok_or(AnswerError::NotFound)?
-            .question;
+        let question = &state.questions.get(id).ok_or(AnswerError::NotFound)?;
         check(question, &answer)?;
         let client = question.client_id;
         let delivered = send(
@@ -256,54 +219,6 @@ impl Broker {
         }
     }
 
-    /// 印は権限確認にだけ付ける。ask の答えは channel で届き、画面を移しただけの質問を別の作業で取り下げると
-    /// Claude が答えを待ち続けるため。待ちをすでに見ていたら、続けて答えが始まっても数えられるよう、そのままにする
-    pub fn mark_focused(&self, id: &QuestionId) {
-        let mut state = self.lock();
-        state.focuses += 1;
-        let seq = state.focuses;
-        if let Some(entry) = state.questions.get_mut(id)
-            && matches!(entry.question.body, QuestionBody::Permission { .. })
-            && entry.focus != Focus::Armed
-        {
-            entry.focus = Focus::Marked(seq);
-        }
-    }
-
-    /// 一覧を取り始める直前に呼び、その一覧を渡す `reconcile_panes` に渡す
-    pub fn listing_start(&self) -> ListingStart {
-        ListingStart(self.lock().focuses)
-    }
-
-    /// 画面を移したあと pane で答えた権限確認を取り下げる。pane が一覧に無いだけでは取り下げない。herdr の一覧は
-    /// agent の居る pane しか返さず、pane が閉じたときは ask-mcp の接続が切れてその質問が消えるため
-    pub fn reconcile_panes(&self, start: ListingStart, panes: &[PaneInfo]) {
-        let mut state = self.lock();
-        let mut answered = Vec::new();
-        for entry in state.questions.values_mut() {
-            let Some(pane) = panes.iter().find(|p| p.id == entry.question.pane_id) else {
-                continue;
-            };
-            let waiting = matches!(pane.status, AgentStatus::Idle | AgentStatus::Blocked);
-            match entry.focus {
-                // focus より前に取り始めた一覧は focus 前の様子なので、待ちに見えても進めない
-                Focus::Marked(seq) if waiting && seq <= start.0 => entry.focus = Focus::Armed,
-                Focus::Armed if pane.status == AgentStatus::Working => {
-                    answered.push(entry.question.id)
-                }
-                _ => {}
-            }
-        }
-        // 判定から取り下げまでの間に同じ質問が回答・再登録されないよう、同じロックの中で取り下げる
-        for id in &answered {
-            withdraw(&mut state, id, WithdrawReason::AnsweredInPane);
-        }
-        drop(state);
-        if !answered.is_empty() {
-            self.changed();
-        }
-    }
-
     /// 全 client の送り手を手放す。SSE のストリームが終わり、ask-mcp の接続が閉じる
     pub fn close_all(&self) {
         let mut state = self.lock();
@@ -317,7 +232,7 @@ impl Broker {
     /// 通知する質問の今の写しを返す。無ければ通知済みから外し、切断中だった質問がつなぎ直して再登録されたときに鳴らす
     pub fn to_announce(&self, id: &QuestionId) -> Option<Question> {
         let mut state = self.lock();
-        let question = state.questions.get(id).map(|entry| entry.question.clone());
+        let question = state.questions.get(id).cloned();
         if question.is_none() {
             state.notified.remove(id);
         }
@@ -342,7 +257,7 @@ impl Broker {
         state.clients.remove(&client);
         state
             .questions
-            .retain(|_, entry| entry.question.client_id != client);
+            .retain(|_, question| question.client_id != client);
         drop(state);
         self.changed();
     }
@@ -360,12 +275,12 @@ impl Broker {
 
 /// 質問を消して持ち主に知らせる。消したら true
 fn withdraw(state: &mut State, id: &QuestionId, reason: WithdrawReason) -> bool {
-    let Some(entry) = state.questions.remove(id) else {
+    let Some(question) = state.questions.remove(id) else {
         return false;
     };
     state.notified.remove(id);
     let event = ClientEvent::Withdrawn { id: *id, reason };
-    send(state, entry.question.client_id, event);
+    send(state, question.client_id, event);
     true
 }
 
@@ -380,7 +295,7 @@ fn send(state: &mut State, client: ClientId, event: ClientEvent) -> bool {
     state.clients.remove(&client);
     state
         .questions
-        .retain(|_, entry| entry.question.client_id != client);
+        .retain(|_, question| question.client_id != client);
     false
 }
 
