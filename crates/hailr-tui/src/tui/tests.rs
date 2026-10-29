@@ -4,7 +4,7 @@ use hailr_core::protocol::{ClientEvent, ClientId, Question, QuestionBody};
 use uuid::Uuid;
 
 use super::*;
-use crate::broker::ClientGuard;
+use crate::broker::{AnswerError, ClientGuard};
 use crate::test_support::{self, QuestionExt};
 
 fn ask(client: ClientId, options: &[&str]) -> Question {
@@ -1000,4 +1000,70 @@ fn answers_and_selects_by_click() {
     assert!(!app.just_moved(), "a click on the list is a choice");
     apply(&mut app, &broker, click(Target::Button(0)));
     assert!(events.try_recv().is_ok());
+}
+
+#[test]
+fn does_not_answer_a_button_that_an_update_removed() {
+    let (broker, client, mut events, _guard) = connected();
+    let question = ask(client, &["Yes", "No", "Maybe"]);
+    broker.register(question.clone()).unwrap();
+    let mut app = loaded(&broker);
+    app.set_shown_buttons(3);
+
+    let updated = question.options(&["Yes", "No"]);
+    broker.register(updated.clone()).unwrap();
+    app.set_questions(broker.snapshot());
+    apply(&mut app, &broker, Action::Answer(2));
+    assert!(events.try_recv().is_err(), "the third button is gone");
+    assert!(app.notice().is_none());
+    assert_eq!(broker.snapshot(), vec![updated.clone()]);
+    apply(&mut app, &broker, Action::Answer(1));
+    let answered = ClientEvent::Answered {
+        id: updated.id,
+        answer: "No".into(),
+    };
+    assert_eq!(
+        events.try_recv().unwrap(),
+        answered,
+        "the buttons left still answer"
+    );
+}
+
+#[test]
+fn answers_with_the_reordered_options_after_an_update() {
+    let (broker, client, mut events, _guard) = connected();
+    let question = ask(client, &["Yes", "No"]);
+    broker.register(question.clone()).unwrap();
+    let mut app = loaded(&broker);
+
+    let updated = question.clone().options(&["No", "Yes"]);
+    broker.register(updated).unwrap();
+    app.set_questions(broker.snapshot());
+    apply(&mut app, &broker, Action::Answer(0));
+    let answered = ClientEvent::Answered {
+        id: question.id,
+        answer: "No".into(),
+    };
+    assert_eq!(events.try_recv().unwrap(), answered);
+    assert!(app.notice().is_none());
+}
+
+#[test]
+fn refuses_an_option_removed_before_the_screen_caught_up() {
+    let (broker, client, mut events, _guard) = connected();
+    let question = ask(client, &["Yes", "No"]);
+    broker.register(question.clone()).unwrap();
+    let mut app = loaded(&broker);
+
+    let updated = question.options(&["No"]);
+    broker.register(updated.clone()).unwrap();
+    apply(&mut app, &broker, Action::Answer(0));
+    assert!(events.try_recv().is_err(), "the old first option is gone");
+    assert!(
+        app.notice()
+            .unwrap()
+            .ends_with(&AnswerError::NotAnOption.to_string())
+    );
+    assert_eq!(broker.snapshot(), vec![updated.clone()]);
+    assert_eq!(app.selected(), Some(&updated));
 }

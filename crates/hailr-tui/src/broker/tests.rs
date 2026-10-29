@@ -392,3 +392,39 @@ fn takes_a_typed_reply_for_questions_only() {
         Err(AnswerError::NotAQuestion)
     );
 }
+
+#[test]
+fn close_all_drops_everything_and_closes_the_streams() {
+    let broker = Broker::new();
+    let changes = broker.changes();
+    let c = client();
+    let (mut rx, _guard) = broker.connect(c);
+    broker.register(ask(c, 1, &["Yes"])).unwrap();
+    let before = *changes.borrow();
+
+    broker.close_all();
+    assert!(broker.snapshot().is_empty());
+    assert_eq!(rx.try_recv(), Err(mpsc::error::TryRecvError::Disconnected));
+    assert!(*changes.borrow() > before, "close_all must notify");
+    assert_eq!(
+        broker.register(ask(c, 2, &[])),
+        Err(RegisterError::NoClient)
+    );
+}
+
+#[test]
+fn announces_again_after_close_all() {
+    let broker = Broker::new();
+    let mut arrivals = broker.arrivals();
+    let c = client();
+    let (_old_rx, _old_guard) = broker.connect(c);
+    let q = permission(c, 1);
+    broker.register(q.clone()).unwrap();
+    assert_eq!(arrivals.try_recv().unwrap(), q.id);
+
+    broker.close_all();
+    let (_new_rx, _new_guard) = broker.connect(c);
+    assert_eq!(broker.register(q.clone()), Ok(Registered::New));
+    assert_eq!(arrivals.try_recv().unwrap(), q.id);
+    assert!(arrivals.try_recv().is_err());
+}
