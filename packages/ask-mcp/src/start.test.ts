@@ -11,7 +11,7 @@ test("hands broker events to the session and asks again after the connection dro
   const { clientId, session } = startSession(fake.socket, async (n) => void notices.push(n), 10);
   onTestFinished(() => closeSession(session));
 
-  const asked = question(clientId);
+  const asked = question({ clientId });
   await ask(session, asked);
   expect(fake.received).toEqual([asked]);
 

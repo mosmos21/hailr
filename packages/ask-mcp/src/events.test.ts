@@ -1,8 +1,7 @@
-import { readFileSync } from "node:fs";
-
 import { expect, test } from "vitest";
 
 import { clientEvent, readSse } from "./events.ts";
+import { fixture } from "./testing.ts";
 
 test.each([
   "event-answered.json",
@@ -10,8 +9,7 @@ test.each([
   "event-withdrawn-deleted.json",
   "event-withdrawn-pane-closed.json",
 ])("reads the protocol fixture %s", (name) => {
-  const url = new URL(`../../../fixtures/protocol/${name}`, import.meta.url);
-  expect(clientEvent.safeParse(JSON.parse(readFileSync(url, "utf8"))).success).toBe(true);
+  expect(clientEvent.safeParse(fixture(name)).success).toBe(true);
 });
 
 test("splits SSE into data and keeps the unfinished part", () => {

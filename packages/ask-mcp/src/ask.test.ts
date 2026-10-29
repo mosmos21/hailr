@@ -1,38 +1,15 @@
-import { readFileSync } from "node:fs";
-
 import { expect, test } from "vitest";
 import * as z from "zod";
 
-import { type AskDeps, askHuman, askInput } from "./ask.ts";
+import { askHuman, askInput } from "./ask.ts";
 import { BrokerUnavailable, type Question, Rejected } from "./broker.ts";
-
-const deps = (ask: (q: Question) => Promise<void> = async () => {}) => {
-  const asked: Question[] = [];
-  const value: AskDeps = {
-    asker: {
-      clientId: "c1",
-      ask: async (q) => {
-        asked.push(q);
-        await ask(q);
-      },
-    },
-    paneId: "w1:p1",
-    now: () => 42,
-    newId: () => "q1",
-  };
-  return { value, asked };
-};
-
-const fixture = (name: string): Question => {
-  const url = new URL(`../../../fixtures/protocol/${name}`, import.meta.url);
-  return JSON.parse(readFileSync(url, "utf8")) as Question;
-};
+import { askDeps, fixture } from "./testing.ts";
 
 test.each(["question-ask.json", "question-ask-minimal.json"])(
   "sends what the protocol fixture %s shows",
   async (name) => {
-    const expected = fixture(name);
-    const { value, asked } = deps();
+    const expected = fixture(name) as Question;
+    const { value, asked } = askDeps({ expected });
     if (expected.body.kind !== "ask") throw new Error("fixture is not an ask");
     const { title, question, options, links } = expected.body;
     const input = {
@@ -41,13 +18,7 @@ test.each(["question-ask.json", "question-ask-minimal.json"])(
       ...(options.length > 0 && { options }),
       ...(links.length > 0 && { links }),
     };
-    const text = await askHuman(input, {
-      ...value,
-      asker: value.asker && { ...value.asker, clientId: expected.clientId },
-      paneId: expected.paneId,
-      now: () => expected.askedAt,
-      newId: () => expected.id,
-    });
+    const text = await askHuman(input, value);
     expect(asked).toEqual([expected]);
     expect(text).toContain(expected.id);
   },
@@ -56,15 +27,19 @@ test.each(["question-ask.json", "question-ask-minimal.json"])(
 test("explains why it cannot ask", async () => {
   const input = { title: "t", question: "q" };
   for (const paneId of [undefined, "", "-x"]) {
-    await expect(askHuman(input, { ...deps().value, paneId })).rejects.toThrow("herdr pane");
+    await expect(askHuman(input, { ...askDeps().value, paneId })).rejects.toThrow("herdr pane");
   }
-  await expect(askHuman(input, { ...deps().value, asker: undefined })).rejects.toThrow("socket");
-  const down = deps(async () => {
-    throw new BrokerUnavailable("ENOENT");
+  await expect(askHuman(input, { ...askDeps().value, asker: undefined })).rejects.toThrow("socket");
+  const down = askDeps({
+    ask: async () => {
+      throw new BrokerUnavailable("ENOENT");
+    },
   });
   await expect(askHuman(input, down.value)).rejects.toThrow("hailr is not running");
-  const refused = deps(async () => {
-    throw new Rejected("too many links");
+  const refused = askDeps({
+    ask: async () => {
+      throw new Rejected("too many links");
+    },
   });
   await expect(askHuman(input, refused.value)).rejects.toThrow("refused the question: too many links");
 });

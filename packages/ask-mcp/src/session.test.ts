@@ -1,7 +1,7 @@
 import { afterEach, expect, onTestFinished, test, vi } from "vitest";
 
 import { BrokerUnavailable, type Question, Rejected } from "./broker.ts";
-import { type ChannelNotification, channelNotification, permissionVerdict } from "./channel.ts";
+import type { ChannelNotification } from "./channel.ts";
 import {
   type Notify,
   ask,
@@ -11,20 +11,19 @@ import {
   handleLost,
   pending,
 } from "./session.ts";
+import { permission, question } from "./testing.ts";
+
+const verdict = ({ requestId, behavior }: { requestId: string; behavior: "allow" | "deny" }) => ({
+  method: "notifications/claude/channel/permission",
+  params: { request_id: requestId, behavior },
+});
 
 afterEach(() => {
   vi.useRealTimers();
 });
 
-const question = (id: string, title = "Merge?"): Question => {
-  return {
-    id,
-    clientId: "c1",
-    paneId: "w1:p1",
-    askedAt: 1,
-    body: { kind: "ask", title, question: "q", options: [], links: [] },
-  };
-};
+const logged = (log: { mock: { calls: unknown[][] } }, text: string) =>
+  log.mock.calls.filter(([m]) => String(m).includes(text)).length;
 
 const setup = () => {
   const calls: string[] = [];
@@ -76,24 +75,24 @@ test("keeps the question from before it is sent until the answer", async () => {
   s.onRegister(async (q) => {
     expect(pending(s.session)).toEqual([q]);
   });
-  await ask(s.session, question("q1"));
+  await ask(s.session, question({ id: "q1" }));
   expect(s.calls).toEqual(["connect", "register q1"]);
 
   s.onRegister(async () => {
     throw new Rejected("no");
   });
-  await expect(ask(s.session, question("q2"))).rejects.toBeInstanceOf(Rejected);
+  await expect(ask(s.session, question({ id: "q2" }))).rejects.toBeInstanceOf(Rejected);
   s.onRegister(async () => {
     throw new BrokerUnavailable("the reply was cut off");
   });
-  await expect(ask(s.session, question("q3"))).rejects.toBeInstanceOf(BrokerUnavailable);
+  await expect(ask(s.session, question({ id: "q3" }))).rejects.toBeInstanceOf(BrokerUnavailable);
   expect(pending(s.session).map((q) => q.id)).toEqual(["q1"]);
 });
 
 test("tells Claude about answers and dismissals once", async () => {
   const s = setup();
   for (const id of ["a", "b", "c", "d"]) {
-    await ask(s.session, question(id, `T${id}`));
+    await ask(s.session, question({ id, title: `T${id}` }));
   }
   handleEvent(s.session, { type: "answered", id: "a", answer: "Yes" });
   handleEvent(s.session, { type: "answered", id: "a", answer: "again" });
@@ -105,11 +104,17 @@ test("tells Claude about answers and dismissals once", async () => {
   handleEvent(s.session, { type: "answered", id: "unknown", answer: "x" });
   expect(log).toHaveBeenCalledWith(expect.stringContaining("unknown"));
   expect(s.notices).toEqual([
-    channelNotification('The human answered "Ta": Yes', { question_id: "a", event: "answered" }),
-    channelNotification('The human dismissed "Tb" without answering.', {
-      question_id: "b",
-      event: "dismissed",
-    }),
+    {
+      method: "notifications/claude/channel",
+      params: { content: 'The human answered "Ta": Yes', meta: { question_id: "a", event: "answered" } },
+    },
+    {
+      method: "notifications/claude/channel",
+      params: {
+        content: 'The human dismissed "Tb" without answering.',
+        meta: { question_id: "b", event: "dismissed" },
+      },
+    },
   ]);
   expect(pending(s.session)).toEqual([]);
 });
@@ -119,7 +124,7 @@ test("sends an answer that arrives before the broker replies once", async () => 
   s.onRegister(async (q) => {
     handleEvent(s.session, { type: "answered", id: q.id, answer: "Yes" });
   });
-  await ask(s.session, question("q1"));
+  await ask(s.session, question({ id: "q1" }));
   expect(s.notices).toHaveLength(1);
   expect(pending(s.session)).toEqual([]);
 });
@@ -129,56 +134,79 @@ test("logs a notification Claude Code cannot take", async () => {
   const log = vi.spyOn(console, "error").mockImplementation(() => {});
   onTestFinished(() => log.mockRestore());
   s.failNotify();
-  await ask(s.session, question("q1"));
+  await ask(s.session, question({ id: "q1" }));
   handleEvent(s.session, { type: "answered", id: "q1", answer: "Yes" });
   await vi.waitFor(() => expect(log).toHaveBeenCalledWith(expect.stringContaining("stdout closed")));
   expect(pending(s.session)).toEqual([]);
 });
 
-test("connects again and asks the unanswered questions again", async () => {
+test("connects again a second after the connection drops, once for repeated drops", async () => {
   vi.useFakeTimers();
-  const log = vi.spyOn(console, "error").mockImplementation(() => {});
-  onTestFinished(() => log.mockRestore());
   const s = setup();
-  for (const id of ["q1", "q2", "q3"]) {
-    await ask(s.session, question(id));
-  }
+  await ask(s.session, question({ id: "q1" }));
   s.calls.length = 0;
-
-  s.failConnect(true);
   handleLost(s.session);
   handleLost(s.session);
   await vi.advanceTimersByTimeAsync(999);
   expect(s.calls).toEqual([]);
   await vi.advanceTimersByTimeAsync(1);
-  await vi.advanceTimersByTimeAsync(1000);
-  expect(s.calls).toEqual(["connect", "connect"]);
-  const waiting = () => log.mock.calls.filter(([m]) => String(m).includes("waiting")).length;
-  expect(waiting()).toBe(1);
-
-  s.failConnect(false);
-  s.onRegister(async (q) => {
-    if (q.id === "q1") handleEvent(s.session, { type: "answered", id: "q2", answer: "Yes" });
-    if (q.id === "q3") throw new Rejected("no longer valid");
-  });
-  await vi.advanceTimersByTimeAsync(1000);
-  expect(s.calls.slice(2)).toEqual(["connect", "register q1", "register q3"]);
-  expect(pending(s.session).map((q) => q.id)).toEqual(["q1"]);
+  expect(s.calls).toEqual(["connect", "register q1"]);
   await vi.advanceTimersByTimeAsync(3000);
-  expect(s.calls).toHaveLength(5);
-
-  s.failConnect(true);
-  handleLost(s.session);
-  await vi.advanceTimersByTimeAsync(1000);
-  expect(waiting()).toBe(2);
+  expect(s.calls).toHaveLength(2);
 });
 
-test("asks again only while hailr cannot be reached, logging once", async () => {
+test("keeps connecting while hailr is down, warning once per outage", async () => {
   vi.useFakeTimers();
   const log = vi.spyOn(console, "error").mockImplementation(() => {});
   onTestFinished(() => log.mockRestore());
   const s = setup();
-  await ask(s.session, question("q1"));
+  await ask(s.session, question({ id: "q1" }));
+  s.calls.length = 0;
+
+  s.failConnect(true);
+  handleLost(s.session);
+  await vi.advanceTimersByTimeAsync(2000);
+  expect(s.calls).toEqual(["connect", "connect"]);
+  expect(logged(log, "waiting")).toBe(1);
+
+  s.failConnect(false);
+  await vi.advanceTimersByTimeAsync(1000);
+  expect(s.calls.slice(2)).toEqual(["connect", "register q1"]);
+  expect(logged(log, "connected again")).toBe(1);
+
+  s.failConnect(true);
+  handleLost(s.session);
+  await vi.advanceTimersByTimeAsync(1000);
+  expect(logged(log, "waiting")).toBe(2);
+});
+
+test("asks again only what is still unanswered", async () => {
+  vi.useFakeTimers();
+  const log = vi.spyOn(console, "error").mockImplementation(() => {});
+  onTestFinished(() => log.mockRestore());
+  const s = setup();
+  for (const id of ["q1", "q2", "q3"]) {
+    await ask(s.session, question({ id }));
+  }
+  s.calls.length = 0;
+  s.onRegister(async (q) => {
+    if (q.id === "q1") handleEvent(s.session, { type: "answered", id: "q2", answer: "Yes" });
+    if (q.id === "q3") throw new Rejected("no longer valid");
+  });
+  handleLost(s.session);
+  await vi.advanceTimersByTimeAsync(1000);
+  expect(s.calls).toEqual(["connect", "register q1", "register q3"]);
+  expect(pending(s.session).map((q) => q.id)).toEqual(["q1"]);
+  await vi.advanceTimersByTimeAsync(3000);
+  expect(s.calls).toHaveLength(3);
+});
+
+test("registers again only while hailr cannot be reached, giving up on other errors", async () => {
+  vi.useFakeTimers();
+  const log = vi.spyOn(console, "error").mockImplementation(() => {});
+  onTestFinished(() => log.mockRestore());
+  const s = setup();
+  await ask(s.session, question({ id: "q1" }));
   s.calls.length = 0;
   let attempts = 0;
   s.onRegister(async () => {
@@ -189,7 +217,7 @@ test("asks again only while hailr cannot be reached, logging once", async () => 
   handleLost(s.session);
   await vi.advanceTimersByTimeAsync(5000);
   expect(s.calls).toEqual(["connect", "register q1", "connect", "register q1", "connect", "register q1"]);
-  expect(log.mock.calls.filter(([m]) => String(m).includes("not asked again"))).toHaveLength(1);
+  expect(logged(log, "not asked again")).toBe(1);
   expect(log).toHaveBeenCalledWith(expect.stringContaining("cannot be asked again"));
   expect(pending(s.session).map((q) => q.id)).toEqual(["q1"]);
 });
@@ -197,8 +225,8 @@ test("asks again only while hailr cannot be reached, logging once", async () => 
 test("runs one round at a time and stops in the middle on close", async () => {
   vi.useFakeTimers();
   const s = setup();
-  await ask(s.session, question("q1"));
-  await ask(s.session, question("q2"));
+  await ask(s.session, question({ id: "q1" }));
+  await ask(s.session, question({ id: "q2" }));
   s.calls.length = 0;
   let release = () => {};
   s.onRegister(() => new Promise<void>((resolve) => (release = resolve)));
@@ -216,7 +244,7 @@ test("runs one round at a time and stops in the middle on close", async () => {
 test("stops for good when closed while connecting again", async () => {
   vi.useFakeTimers();
   const s = setup();
-  await ask(s.session, question("q1"));
+  await ask(s.session, question({ id: "q1" }));
   s.calls.length = 0;
   const reject = s.holdConnect();
   handleLost(s.session);
@@ -230,7 +258,7 @@ test("stops for good when closed while connecting again", async () => {
 test("does not connect when the question was answered before the timer fired", async () => {
   vi.useFakeTimers();
   const s = setup();
-  await ask(s.session, question("q1"));
+  await ask(s.session, question({ id: "q1" }));
   s.calls.length = 0;
   handleLost(s.session);
   handleEvent(s.session, { type: "answered", id: "q1", answer: "Yes" });
@@ -245,19 +273,12 @@ test("waits for the next question when nothing is pending, and stops on close", 
   await vi.advanceTimersByTimeAsync(5000);
   expect(s.calls).toEqual([]);
 
-  await ask(s.session, question("q1"));
+  await ask(s.session, question({ id: "q1" }));
   handleLost(s.session);
   closeSession(s.session);
   await vi.advanceTimersByTimeAsync(5000);
   expect(s.calls).toEqual(["connect", "register q1", "close"]);
 });
-
-const permission = (id: string, requestId: string): Question => {
-  return {
-    ...question(id),
-    body: { kind: "permission", requestId, toolName: "Bash", description: "d", inputPreview: "p" },
-  };
-};
 
 test("answers permission requests with allow or deny and nothing else", async () => {
   const log = vi.spyOn(console, "error").mockImplementation(() => {});
@@ -265,10 +286,10 @@ test("answers permission requests with allow or deny and nothing else", async ()
   const s = setup();
   const odd = ["Yes", "constructor", "toString", "__proto__"];
   for (const [id, requestId] of [["p1", "abcde"], ["p2", "fghij"], ["p4", "qrstu"]] as const) {
-    await ask(s.session, permission(id, requestId));
+    await ask(s.session, permission({ id, requestId }));
   }
   for (const answer of odd) {
-    await ask(s.session, permission(answer, "kmnop"));
+    await ask(s.session, permission({ id: answer, requestId: "kmnop" }));
   }
   handleEvent(s.session, { type: "answered", id: "p1", answer: "Allow" });
   handleEvent(s.session, { type: "answered", id: "p2", answer: "Deny" });
@@ -276,7 +297,10 @@ test("answers permission requests with allow or deny and nothing else", async ()
     handleEvent(s.session, { type: "answered", id: answer, answer });
   }
   handleEvent(s.session, { type: "withdrawn", id: "p4", reason: "deleted" });
-  expect(s.notices).toEqual([permissionVerdict("abcde", "allow"), permissionVerdict("fghij", "deny")]);
+  expect(s.notices).toEqual([
+    verdict({ requestId: "abcde", behavior: "allow" }),
+    verdict({ requestId: "fghij", behavior: "deny" }),
+  ]);
   expect(log).toHaveBeenCalledWith(expect.stringContaining("neither Allow nor Deny"));
   expect(pending(s.session)).toEqual([]);
 });
@@ -284,8 +308,8 @@ test("answers permission requests with allow or deny and nothing else", async ()
 test("does not bring back permission requests after reconnecting", async () => {
   vi.useFakeTimers();
   const s = setup();
-  await ask(s.session, permission("p1", "abcde"));
-  await ask(s.session, question("q1"));
+  await ask(s.session, permission({ id: "p1", requestId: "abcde" }));
+  await ask(s.session, question({ id: "q1" }));
   s.calls.length = 0;
   handleLost(s.session);
   expect(pending(s.session).map((q) => q.id)).toEqual(["q1"]);
@@ -293,7 +317,7 @@ test("does not bring back permission requests after reconnecting", async () => {
   expect(s.calls).toEqual(["connect", "register q1"]);
 
   handleEvent(s.session, { type: "answered", id: "q1", answer: "x" });
-  await ask(s.session, permission("p2", "fghij"));
+  await ask(s.session, permission({ id: "p2", requestId: "fghij" }));
   s.calls.length = 0;
   handleLost(s.session);
   await vi.advanceTimersByTimeAsync(5000);
@@ -303,17 +327,17 @@ test("does not bring back permission requests after reconnecting", async () => {
 test("keeps a permission request that arrives while reconnecting", async () => {
   vi.useFakeTimers();
   const s = setup();
-  await ask(s.session, question("q1"));
+  await ask(s.session, question({ id: "q1" }));
   s.calls.length = 0;
   const reject = s.holdConnect();
   handleLost(s.session);
   await vi.advanceTimersByTimeAsync(1000);
-  const asking = ask(s.session, permission("p1", "abcde"));
+  const asking = ask(s.session, permission({ id: "p1", requestId: "abcde" }));
   reject(new BrokerUnavailable("ENOENT"));
   await expect(asking).rejects.toBeInstanceOf(BrokerUnavailable);
   s.failConnect(false);
-  await ask(s.session, permission("p2", "fghij"));
+  await ask(s.session, permission({ id: "p2", requestId: "fghij" }));
   await vi.advanceTimersByTimeAsync(1000);
   handleEvent(s.session, { type: "answered", id: "p2", answer: "Allow" });
-  expect(s.notices).toEqual([permissionVerdict("fghij", "allow")]);
+  expect(s.notices).toEqual([verdict({ requestId: "fghij", behavior: "allow" })]);
 });
