@@ -92,7 +92,7 @@ mod tests {
             .unwrap()
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn reads_the_selected_pane_right_away_and_reports_failures() {
         let (pane_tx, pane_rx) = watch::channel(None);
         let (shot_tx, mut shots) = mpsc::channel(4);

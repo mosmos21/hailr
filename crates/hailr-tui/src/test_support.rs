@@ -1,6 +1,5 @@
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Duration;
+use std::sync::{Mutex, mpsc as std_mpsc};
 
 use hailr_core::mux::{Mux, MuxError, PaneInfo};
 use hailr_core::protocol::{ClientId, PaneId, Question, QuestionBody, QuestionId};
@@ -111,19 +110,30 @@ impl QuestionExt for Question {
 }
 
 /// 偽の Mux。読んだ pane を覚えて "bad" だけ読みに失敗し、
-/// `notifying` で作ると notify の値を送り出して失敗を返し、同時に走った数の最大も数える
+/// `notifying` で作ると notify の値を送り出し、解放されるまで止まってから失敗を返す。同時に走った数の最大も数える
 #[derive(Default)]
 pub struct FakeMux {
     pub read: Mutex<Vec<String>>,
-    sent: Option<mpsc::UnboundedSender<(String, String)>>,
+    notifier: Option<Notifier>,
     running: AtomicUsize,
     pub most: AtomicUsize,
 }
 
+struct Notifier {
+    sent: mpsc::UnboundedSender<(String, String)>,
+    release: Mutex<std_mpsc::Receiver<()>>,
+}
+
 impl FakeMux {
-    pub fn notifying(sent: mpsc::UnboundedSender<(String, String)>) -> Self {
+    pub fn notifying(
+        sent: mpsc::UnboundedSender<(String, String)>,
+        release: std_mpsc::Receiver<()>,
+    ) -> Self {
         Self {
-            sent: Some(sent),
+            notifier: Some(Notifier {
+                sent,
+                release: Mutex::new(release),
+            }),
             ..Self::default()
         }
     }
@@ -147,14 +157,15 @@ impl Mux for FakeMux {
     }
 
     fn notify(&self, title: &str, body: &str) -> Result<(), MuxError> {
-        let Some(sent) = &self.sent else {
+        let Some(notifier) = &self.notifier else {
             unimplemented!("notify on a FakeMux made without notifying");
         };
         let now = self.running.fetch_add(1, Ordering::SeqCst) + 1;
         self.most.fetch_max(now, Ordering::SeqCst);
-        std::thread::sleep(Duration::from_millis(5));
+        notifier.sent.send((title.into(), body.into())).unwrap();
+        // テストが送り手を捨てたら待たずに返すため、recv の失敗は捨てる
+        let _ = notifier.release.lock().unwrap().recv();
         self.running.fetch_sub(1, Ordering::SeqCst);
-        sent.send((title.into(), body.into())).unwrap();
         Err(MuxError::InvalidPane)
     }
 }

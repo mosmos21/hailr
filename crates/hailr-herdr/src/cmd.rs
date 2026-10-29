@@ -19,6 +19,16 @@ pub(crate) fn run(
     args: &[&str],
     timeout: Duration,
 ) -> Result<Vec<u8>, MuxError> {
+    run_limited(bin, name, args, timeout, STDOUT_LIMIT)
+}
+
+fn run_limited(
+    bin: &Path,
+    name: &str,
+    args: &[&str],
+    timeout: Duration,
+    stdout_limit: u64,
+) -> Result<Vec<u8>, MuxError> {
     let command = format!("{} {name}", bin.display());
     let deadline = Instant::now() + timeout;
     // 期限切れのときに孫までまとめて止めるため、子を自分のプロセスグループに入れる
@@ -35,7 +45,7 @@ pub(crate) fn run(
         })?;
 
     // パイプの容量を超える出力で子が止まらないよう、待つのと並行して読み切る
-    let stdout = drain(child.stdout.take(), STDOUT_LIMIT);
+    let stdout = drain(child.stdout.take(), stdout_limit);
     let stderr = drain(child.stderr.take(), STDERR_LIMIT);
 
     let status = match child.wait_timeout(timeout) {
@@ -110,23 +120,31 @@ mod tests {
 
     #[test]
     fn caps_stdout() {
-        let script = format!("head -c {} /dev/zero", STDOUT_LIMIT + 1024);
-        let out = sh(&script, Duration::from_secs(10)).unwrap();
-        assert_eq!(out.len() as u64, STDOUT_LIMIT);
+        // パイプの容量を超えて書かせ、上限を超えた分の読み捨てまで通すため、上限より大きく書く
+        let out = run_limited(
+            Path::new("sh"),
+            "test",
+            &["-c", "head -c 1000000 /dev/zero"],
+            Duration::from_secs(10),
+            1024,
+        )
+        .unwrap();
+        assert_eq!(out.len(), 1024);
     }
 
     #[test]
     fn stops_an_endless_writer_at_the_deadline() {
+        let timeout = Duration::from_millis(500);
         let started = Instant::now();
-        let err = sh("yes", Duration::from_millis(500)).unwrap_err();
+        let err = sh("yes", timeout).unwrap_err();
         assert!(matches!(err, MuxError::Timeout { .. }));
-        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(started.elapsed() < timeout + Duration::from_secs(2));
     }
 
     #[test]
     fn keeps_stdout_when_stderr_floods() {
         let out = sh(
-            "head -c 20000000 /dev/zero >&2; printf ok",
+            "head -c 1000000 /dev/zero >&2; printf ok",
             Duration::from_secs(10),
         )
         .unwrap();
@@ -152,7 +170,7 @@ mod tests {
         let started = Instant::now();
         let err = sh(&script(&pid_file.display().to_string()), timeout).unwrap_err();
         assert!(matches!(err, MuxError::Timeout { .. }));
-        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(started.elapsed() < timeout + Duration::from_secs(2));
 
         let pid: libc::pid_t = std::fs::read_to_string(&pid_file)
             .unwrap()
@@ -160,7 +178,7 @@ mod tests {
             .parse()
             .unwrap();
         // 殺された孫は回収されるまで残るため、すぐには消えない
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let deadline = Instant::now() + Duration::from_secs(10);
         // SAFETY: シグナル 0 は存在の確認だけで、何も送らない
         while unsafe { libc::kill(pid, 0) } == 0 {
             assert!(Instant::now() < deadline, "grandchild {pid} is still alive");
@@ -172,7 +190,7 @@ mod tests {
     fn kills_grandchildren_after_wait_timeout() {
         // 出力を閉じてから走り続けるので、読み取りは終わり、終了待ちの期限切れの経路を通る
         assert_grandchild_killed(
-            |f| format!("sleep 5 >&- 2>&- & echo $! > '{f}'; exec >&- 2>&-; sleep 5"),
+            |f| format!("sleep 30 >&- 2>&- & echo $! > '{f}'; exec >&- 2>&-; sleep 30"),
             Duration::from_millis(300),
         );
     }
@@ -180,7 +198,7 @@ mod tests {
     #[test]
     fn kills_grandchildren_after_read_timeout() {
         assert_grandchild_killed(
-            |f| format!("sleep 5 & echo $! > '{f}'; sleep 5"),
+            |f| format!("sleep 30 & echo $! > '{f}'; sleep 30"),
             Duration::from_millis(300),
         );
     }
@@ -188,7 +206,7 @@ mod tests {
     #[test]
     fn gives_up_on_a_grandchild_holding_the_pipe() {
         assert_grandchild_killed(
-            |f| format!("sleep 5 & echo $! > '{f}'"),
+            |f| format!("sleep 30 & echo $! > '{f}'"),
             Duration::from_millis(300),
         );
     }
