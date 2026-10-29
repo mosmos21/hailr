@@ -12,11 +12,15 @@ import {
   createBroker,
   register,
 } from "./broker.ts";
-import { type Reply, fakeBroker, question, tempDir } from "./testing.ts";
+import { type FakeBrokerOptions, type Reply, fakeBroker, question, tempDir } from "./testing.ts";
 
 /** fakeBroker と、それにつなぐ broker を用意する。broker はテストの終わりに閉じる */
-const setup = async ({ reply, ...options }: BrokerOptions & { reply?: () => Reply } = {}) => {
-  const fake = await fakeBroker(reply);
+const setup = async ({
+  reply,
+  eventsStatus,
+  ...options
+}: BrokerOptions & Pick<FakeBrokerOptions, "reply" | "eventsStatus"> = {}) => {
+  const fake = await fakeBroker({ reply, eventsStatus });
   const client = randomUUID();
   const broker = createBroker(fake.socket, client, options);
   onTestFinished(() => closeBroker(broker));
@@ -81,7 +85,7 @@ test("drops a connection the broker no longer knows", async () => {
 
 test("closes a connection that is still opening", async () => {
   // ヘッダーが届く前に切れることを見るため、テストの期限より長く待たせる
-  const fake = await fakeBroker(undefined, 60_000);
+  const fake = await fakeBroker({ headerDelayMs: 60_000 });
   const client = randomUUID();
   const broker = createBroker(fake.socket, client, { timeoutMs: 60_000 });
   const connecting = connect(broker);
@@ -144,4 +148,29 @@ test("drops a connection that sends an endless event", async () => {
   fake.sse.get(client)?.write(`data: ${"x".repeat((1 << 20) + 1)}`);
   await vi.waitFor(() => expect(fake.streams.get(client)).toBe(0));
   expect(log).toHaveBeenCalledWith(expect.stringContaining("too long"));
+});
+
+test("gives up on events the broker does not serve", async () => {
+  const { broker } = await setup({ eventsStatus: 503 });
+  await expect(connect(broker)).rejects.toThrow("events: 503");
+});
+
+test("keeps a connection opened again while a question was on its way", async () => {
+  let answer = (_: Reply) => {};
+  let lost = 0;
+  const { fake, client, broker } = await setup({
+    reply: () => new Promise<Reply>((resolve) => (answer = resolve)),
+    onLost: () => lost++,
+  });
+  await connect(broker);
+  const registered = register(broker, question({ clientId: client }));
+  await vi.waitFor(() => expect(fake.received).toHaveLength(1));
+  fake.sse.get(client)?.destroy();
+  await vi.waitFor(() => expect(lost).toBe(1));
+  await connect(broker);
+
+  answer([409, "no client"]);
+  await expect(registered).rejects.toThrow("forgot this client");
+  expect(lost).toBe(1);
+  expect(broker.events).toBeDefined();
 });

@@ -18,7 +18,17 @@ export const tempDir = () => {
 export type Reply = [number, string] | "silent" | "cut";
 
 /** broker の代わりに、SSE をつないだ client の質問だけを受け付ける */
-export const fakeBroker = async (reply: () => Reply = () => [201, ""], headerDelayMs = 0) => {
+export type FakeBrokerOptions = {
+  reply?: () => Reply | Promise<Reply>;
+  headerDelayMs?: number;
+  eventsStatus?: number;
+};
+
+export const fakeBroker = async ({
+  reply = () => [201, ""],
+  headerDelayMs = 0,
+  eventsStatus = 200,
+}: FakeBrokerOptions = {}) => {
   const sse = new Map<string, http.ServerResponse>();
   const socket = path.join(tempDir(), "broker.sock");
   const streams = new Map<string, number>();
@@ -27,6 +37,10 @@ export const fakeBroker = async (reply: () => Reply = () => [201, ""], headerDel
     const events = request.url?.match(/^\/clients\/([^/]+)\/events$/);
     if (request.method === "GET" && events?.[1]) {
       const client = events[1];
+      if (eventsStatus !== 200) {
+        response.writeHead(eventsStatus).end();
+        return;
+      }
       streams.set(client, (streams.get(client) ?? 0) + 1);
       const headers = setTimeout(() => {
         response.writeHead(200, { "content-type": "text/event-stream" });
@@ -41,20 +55,23 @@ export const fakeBroker = async (reply: () => Reply = () => [201, ""], headerDel
     }
     let body = "";
     request.on("data", (chunk) => (body += chunk));
-    request.on("end", () => {
+    const answer = async () => {
       const question = JSON.parse(body) as Question;
       if (!streams.get(question.clientId)) {
         response.writeHead(409).end("no client");
         return;
       }
       received.push(question);
-      const answer = reply();
-      if (answer === "cut") {
+      const replied = await reply();
+      if (replied === "cut") {
         response.writeHead(201, { "content-length": "100" });
         response.write("partial", () => response.socket?.destroy());
-      } else if (answer !== "silent") {
-        response.writeHead(answer[0]).end(answer[1]);
+      } else if (replied !== "silent") {
+        response.writeHead(replied[0]).end(replied[1]);
       }
+    };
+    request.on("end", () => {
+      answer().catch((e: unknown) => response.writeHead(500).end(String(e)));
     });
   });
   await new Promise<void>((resolve) => server.listen(socket, resolve));
