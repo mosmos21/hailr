@@ -86,6 +86,13 @@ impl App {
                 .unwrap_or(questions.len());
             questions.insert(at, answered.question.clone());
         }
+        // 選択肢が並べ替わった瞬間に押した数字が、見ていなかった選択肢の答えにならないよう、移ったときと同じく少しの間答えさせない
+        if let Some(before) = self.selected()
+            && let Some(after) = questions.iter().find(|q| q.id == before.id)
+            && after.body.options() != before.body.options()
+        {
+            self.moved_at = Some(Instant::now());
+        }
         self.questions = questions;
         if let Some(replying) = self.replying.as_mut()
             && !self.questions.iter().any(|q| q.id == replying.id)

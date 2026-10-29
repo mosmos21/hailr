@@ -1013,6 +1013,8 @@ fn does_not_answer_a_button_that_an_update_removed() {
     let updated = question.options(&["Yes", "No"]);
     broker.register(updated.clone()).unwrap();
     app.set_questions(broker.snapshot());
+    assert!(app.just_moved(), "options changed");
+    app.settle_move();
     apply(&mut app, &broker, Action::Answer(2));
     assert!(events.try_recv().is_err(), "the third button is gone");
     assert!(app.notice().is_none());
@@ -1030,7 +1032,7 @@ fn does_not_answer_a_button_that_an_update_removed() {
 }
 
 #[test]
-fn answers_with_the_reordered_options_after_an_update() {
+fn ignores_a_digit_just_after_the_options_are_reordered() {
     let (broker, client, mut events, _guard) = connected();
     let question = ask(client, &["Yes", "No"]);
     broker.register(question.clone()).unwrap();
@@ -1039,13 +1041,53 @@ fn answers_with_the_reordered_options_after_an_update() {
     let updated = question.clone().options(&["No", "Yes"]);
     broker.register(updated).unwrap();
     app.set_questions(broker.snapshot());
+    assert_eq!(apply(&mut app, &broker, Action::Answer(0)), None);
+    assert!(events.try_recv().is_err(), "pressed for the old order");
+    app.settle_move();
     apply(&mut app, &broker, Action::Answer(0));
     let answered = ClientEvent::Answered {
         id: question.id,
         answer: "No".into(),
     };
-    assert_eq!(events.try_recv().unwrap(), answered);
+    assert_eq!(
+        events.try_recv().unwrap(),
+        answered,
+        "the new order once seen"
+    );
     assert!(app.notice().is_none());
+}
+
+#[test]
+fn answers_at_once_when_only_the_text_is_updated() {
+    let (broker, client, mut events, _guard) = connected();
+    let question = ask(client, &["Yes", "No"]);
+    broker.register(question.clone()).unwrap();
+    let mut app = loaded(&broker);
+
+    broker.register(question.clone().text("reworded")).unwrap();
+    app.set_questions(broker.snapshot());
+    assert!(!app.just_moved());
+    apply(&mut app, &broker, Action::Answer(0));
+    assert!(events.try_recv().is_ok());
+}
+
+#[test]
+fn answers_at_once_when_another_question_changes_its_options() {
+    let (broker, client, mut events, _guard) = connected();
+    let first = ask(client, &["Yes", "No"]);
+    let mut second = ask(client, &["Yes", "No"]);
+    second.asked_at = 2;
+    let mut app = second_selected(&broker, &[first.clone(), second.clone()]);
+
+    broker.register(first.options(&["No", "Yes"])).unwrap();
+    app.set_questions(broker.snapshot());
+    assert!(!app.just_moved());
+    apply(&mut app, &broker, Action::Answer(0));
+    let answered = ClientEvent::Answered {
+        id: second.id,
+        answer: "Yes".into(),
+    };
+    assert_eq!(events.try_recv().unwrap(), answered);
 }
 
 #[test]
@@ -1066,6 +1108,7 @@ fn refuses_an_option_removed_before_the_screen_caught_up() {
     );
     assert_eq!(broker.snapshot(), vec![updated.clone()]);
     assert_eq!(app.selected(), Some(&updated));
+    assert!(app.just_moved(), "the refetched options are guarded");
 }
 
 /// 1 つ目の pane に 2 件、2 つ目の pane に 1 件の質問を並べ、1 件目を選んで画面を読んだ状態
