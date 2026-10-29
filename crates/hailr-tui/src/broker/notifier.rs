@@ -5,7 +5,7 @@ use hailr_core::protocol::{QuestionBody, QuestionId};
 use tokio::sync::broadcast::{self, error::RecvError};
 
 use super::Broker;
-use crate::text::is_unprintable;
+use crate::text::printable;
 
 const MAX_TITLE: usize = 100;
 const MAX_BODY: usize = 300;
@@ -43,11 +43,7 @@ fn notice(body: &QuestionBody) -> (String, String) {
 
 // 質問の文言は Claude が書き、mux が端末に描くこともあるため、制御文字と向きを変える文字を空白にして長さを切る
 fn plain(text: &str, max: usize) -> String {
-    let mut out: String = text
-        .chars()
-        .map(|c| if is_unprintable(c) { ' ' } else { c })
-        .take(max)
-        .collect();
+    let mut out: String = printable(text).chars().take(max).collect();
     if text.chars().nth(max).is_some() {
         out.push('…');
     }
