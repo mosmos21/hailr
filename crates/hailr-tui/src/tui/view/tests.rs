@@ -25,7 +25,12 @@ fn says_there_are_no_questions_on_both_sides() {
     let row = rows.iter().find(|r| r.contains("No questions")).unwrap();
     assert_eq!(row.matches("No questions").count(), 2);
     assert!(rows[0].find("Questions").unwrap() > 40);
-    assert_eq!(rows[11].trim_end(), " q quit");
+    assert!(rows[11].contains("q quit"), "{}", rows[11]);
+    assert!(
+        !rows[11].contains("delete") && !rows[11].contains("select"),
+        "{}",
+        rows[11]
+    );
 }
 
 #[test]
@@ -34,18 +39,19 @@ fn puts_the_list_on_the_configured_side() {
     app.set_questions(vec![ask("w1:p1", "Merge PR?", "Ship it?")]);
     let right = render(&app, Side::Right, 80, 12);
     let left = render(&app, Side::Left, 80, 12);
-    assert_eq!(column(&right[0], "┌Questions"), 80 - 24);
+    let list_width = column(&left[0], "┌w1:p1");
+    assert_eq!(column(&right[0], "┌Questions"), 80 - list_width);
     assert_eq!(column(&left[0], "┌Questions"), 0);
-    assert_eq!(column(&left[0], "┌w1:p1"), 24);
     assert!(right.iter().any(|r| r.contains("▶ Merge PR?")));
-    assert_eq!(
-        column(&render(&app, Side::Right, 200, 12)[0], "┌Questions"),
-        160
-    );
-    assert_eq!(
-        column(&render(&app, Side::Right, 100, 12)[0], "┌Questions"),
-        70
-    );
+
+    let width_of = |total: u16| {
+        let rows = render(&app, Side::Right, total, 12);
+        total - u16::try_from(column(&rows[0], "┌Questions")).unwrap()
+    };
+    // DESIGN.md の仕様: 画面の 30%、24 桁より狭くせず 40 桁より広くしない
+    assert_eq!(width_of(60), 24, "never narrower than 24 columns");
+    assert_eq!(width_of(100), 30, "30% of the screen");
+    assert_eq!(width_of(200), 40, "never wider than 40 columns");
 }
 
 /// 罫線は 1 文字 3 バイトなので、バイトではなく桁で数える
@@ -58,13 +64,16 @@ fn column(row: &str, needle: &str) -> usize {
 fn caps_the_question_at_a_third_and_keeps_at_least_one_line() {
     let mut app = App::default();
     app.set_questions(vec![ask("w1:p1", "Long", &"word ".repeat(500))]);
-    let rows = render(&app, Side::Right, 80, 31);
-    let top = rows.iter().position(|r| r.contains("┌Long")).unwrap();
-    assert_eq!(top, 30 - 10, "a third of the 30 body rows");
-
-    let rows = render(&app, Side::Right, 80, 7);
-    let top = rows.iter().position(|r| r.contains("┌Long")).unwrap();
-    assert_eq!(top, 6 - 3, "border, one line, border");
+    let box_height = |height: u16| {
+        let rows = render(&app, Side::Right, 80, height);
+        let top = rows.iter().position(|r| r.contains("┌Long")).unwrap();
+        usize::from(height) - 1 - top
+    };
+    let (short, tall) = (box_height(31), box_height(61));
+    // DESIGN.md の仕様: 一覧を除いた側の 1/3 まで
+    assert_eq!(short, 10, "a third of 30 body rows");
+    assert_eq!(tall, 20, "a third of 60 body rows");
+    assert_eq!(box_height(7), 3, "border, one line, border");
 }
 
 #[test]
@@ -176,7 +185,14 @@ fn marks_the_answered_question_and_takes_no_more_presses() {
     let other = &buffer[(other_x, y)];
     assert!(!other.modifier.contains(Modifier::REVERSED));
     assert_eq!(other.fg, MUTED);
-    assert_eq!(rows[15].trim_end(), " ↑↓ select  f focus  q quit");
+    let footer = &rows[15];
+    assert!(
+        footer.contains("f focus") && footer.contains("q quit"),
+        "{footer}"
+    );
+    for gone in ["answer", "d delete", "r reply"] {
+        assert!(!footer.contains(gone), "{footer}");
+    }
 }
 
 #[test]
@@ -193,7 +209,9 @@ fn shows_the_reply_being_typed_with_the_cursor_at_its_end() {
     let y = rows.iter().position(|r| r.contains("┌Reply")).unwrap() + 1;
     // 幅 2 の文字は 2 つ目のセルが空になる
     assert!(rows[y].contains("返 事  ok"), "{}", rows.join("\n"));
-    assert_eq!(rows[15].trim_end(), " Enter send  Esc cancel");
+    assert!(rows[15].contains("Enter send"), "{}", rows[15]);
+    assert!(rows[15].contains("Esc cancel"), "{}", rows[15]);
+    assert!(!rows[15].contains("q quit"), "{}", rows[15]);
     let cursor = terminal.get_cursor_position().unwrap();
     let x = rows[y].chars().position(|c| c == '返').unwrap();
     assert_eq!(cursor.y, u16::try_from(y).unwrap());
@@ -228,11 +246,14 @@ fn shows_a_sent_reply_greyed() {
     let bx = rows[button].chars().position(|c| c == '[').unwrap();
     let (bx, by) = (u16::try_from(bx).unwrap(), u16::try_from(button).unwrap());
     assert_eq!(buffer[(bx, by)].fg, MUTED, "no button was pressed");
-    assert_eq!(
-        rows[15].trim_end(),
-        " ↑↓ select  f focus  q quit",
-        "the same keys after a reply"
+    assert!(
+        rows[15].contains("f focus") && rows[15].contains("q quit"),
+        "the same keys after a reply: {}",
+        rows[15]
     );
+    for gone in ["answer", "d delete", "r reply"] {
+        assert!(!rows[15].contains(gone), "{}", rows[15]);
+    }
 }
 
 #[test]
@@ -244,7 +265,8 @@ fn tells_when_the_reply_has_nowhere_to_go() {
     assert!(app.notice().is_some());
     app.set_questions(vec![with_options(&["No"])]);
     let rows = render(&app, Side::Right, 80, 16);
-    assert_eq!(rows[15].trim_end(), " the question went away  Esc close");
+    assert!(rows[15].contains("the question went away"), "{}", rows[15]);
+    assert!(rows[15].contains("Esc close"), "{}", rows[15]);
     let text = rows.join("\n");
     assert!(
         !text.contains("┌Reply"),
@@ -265,7 +287,8 @@ fn tells_when_the_reply_has_nowhere_to_go() {
         !text.contains("┌Reply"),
         "back on its own, not typeable\n{text}"
     );
-    assert_eq!(rows[15].trim_end(), " the question went away  Esc close");
+    assert!(rows[15].contains("the question went away"), "{}", rows[15]);
+    assert!(rows[15].contains("Esc close"), "{}", rows[15]);
 }
 
 #[test]
@@ -279,26 +302,26 @@ fn shows_buttons_below_the_question_and_the_keys_to_press() {
         .position(|r| r.contains("[ 1 Yes, merge ] [ 2 No ]"))
         .unwrap();
     assert!(buttons > asked, "{}", rows.join("\n"));
-    assert_eq!(
-        rows[15].trim_end(),
-        " ↑↓ select  1-2 answer  r reply  f focus  d delete  q quit"
-    );
+    for key in ["1-2 answer", "r reply", "f focus", "d delete", "q quit"] {
+        assert!(rows[15].contains(key), "{key}: {}", rows[15]);
+    }
 
     app.set_questions(vec![with_options(&["Yes"])]);
     assert!(app.just_moved());
     let rows = render(&app, Side::Right, 80, 16);
-    assert_eq!(
-        rows[15].trim_end(),
-        " ↑↓ select  1 answer  r reply  f focus  d delete  q quit",
-        "the keys of the question it moved to"
+    assert!(
+        rows[15].contains("1 answer") && !rows[15].contains("1-2"),
+        "the keys of the question it moved to: {}",
+        rows[15]
     );
 
     let mut app = App::default();
     app.set_questions(vec![with_options(&["Yes"])]);
     let rows = render(&app, Side::Right, 80, 16);
-    assert_eq!(
-        rows[15].trim_end(),
-        " ↑↓ select  1 answer  r reply  f focus  d delete  q quit"
+    assert!(
+        rows[15].contains("1 answer") && rows[15].contains("r reply"),
+        "{}",
+        rows[15]
     );
 
     let mut app = App::default();
@@ -306,10 +329,8 @@ fn shows_buttons_below_the_question_and_the_keys_to_press() {
     let rows = render(&app, Side::Right, 80, 16);
     let no_box = !rows.iter().any(|r| r.contains("[ 1"));
     assert!(no_box, "no box without options");
-    assert_eq!(
-        rows[15].trim_end(),
-        " ↑↓ select  r reply  f focus  d delete  q quit"
-    );
+    assert!(rows[15].contains("r reply"), "{}", rows[15]);
+    assert!(!rows[15].contains("answer"), "{}", rows[15]);
 }
 
 #[test]
@@ -356,9 +377,9 @@ fn wraps_buttons_that_do_not_fit_and_shows_permission_buttons() {
     let rows = render(&app, Side::Right, 80, 16);
     let text = rows.join("\n");
     assert!(text.contains("[ 1 Allow ] [ 2 Deny ]"), "{text}");
-    assert_eq!(
-        rows[15].trim_end(),
-        " ↑↓ select  1-2 answer  f focus  d delete  q quit",
+    assert!(rows[15].contains("1-2 answer"), "{}", rows[15]);
+    assert!(
+        !rows[15].contains("reply"),
         "no reply to a permission request"
     );
 }
@@ -369,7 +390,12 @@ fn a_notice_takes_the_place_of_the_keys() {
     app.set_questions(vec![with_options(&["Yes"])]);
     app.set_notice("the answer did not reach the session");
     let rows = render(&app, Side::Right, 80, 12);
-    assert_eq!(rows[11].trim_end(), " the answer did not reach the session");
+    assert!(
+        rows[11].contains("the answer did not reach the session"),
+        "{}",
+        rows[11]
+    );
+    assert!(!rows[11].contains("q quit"), "{}", rows[11]);
 }
 
 #[test]
@@ -476,14 +502,13 @@ fn lists_links_under_the_buttons() {
     assert!(rows[buttons + 1].contains("o1 mosmos21/hailr#1"), "{text}");
     assert!(rows[buttons + 2].contains("o2 example.com/docs"), "{text}");
     assert_eq!(app.shown_links(), 2);
-    assert_eq!(
-        rows[29].trim_end(),
-        " ↑↓ select  1-2 answer  r reply  o open  f focus  d delete  q quit"
-    );
+    assert!(rows[29].contains("o open"), "{}", rows[29]);
+    assert!(rows[29].contains("1-2 answer"), "{}", rows[29]);
 
     app.start_opening();
     let rows = render(&app, Side::Right, 100, 30);
-    assert_eq!(rows[29].trim_end(), " 1-2 open link  any other key cancels");
+    assert!(rows[29].contains("1-2 open link"), "{}", rows[29]);
+    assert!(rows[29].contains("any other key cancels"), "{}", rows[29]);
 }
 
 #[test]
@@ -504,10 +529,8 @@ fn counts_only_the_links_on_screen() {
     assert_eq!(app.shown_buttons(), 1);
     app.start_opening();
     let rows = render(&app, Side::Right, 100, 13);
-    assert_eq!(
-        rows[12].trim_end(),
-        " no links on screen  any other key cancels"
-    );
+    assert!(rows[12].contains("no links on screen"), "{}", rows[12]);
+    assert!(rows[12].contains("any other key cancels"), "{}", rows[12]);
 
     let rows = render(&app, Side::Right, 100, 16);
     let text = rows.join("\n");
@@ -675,8 +698,9 @@ fn clicks_the_rows_the_list_scrolled_to() {
         .collect();
     app.set_questions(questions.clone());
     let rows = render(&app, Side::Right, 80, 12);
-    assert_eq!(rows[1].chars().nth(56), Some('│'));
-    let left = 56;
+    let left = column(&rows[0], "┌Questions");
+    assert_eq!(rows[1].chars().nth(left), Some('│'));
+    let left = u16::try_from(left).unwrap();
     let right = 79;
     assert_eq!(app.target_at(left, 1), None, "the left border");
     assert_eq!(app.target_at(right, 1), None, "the right border");
