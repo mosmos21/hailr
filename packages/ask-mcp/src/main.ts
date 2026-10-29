@@ -1,35 +1,22 @@
 import { randomUUID } from "node:crypto";
 
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 
-import { askHuman, askInput, description } from "./ask.ts";
 import type { Question } from "./broker.ts";
-import { channelCapabilities, permissionRequest } from "./channel.ts";
 import { socketPath } from "./paths.ts";
-import { askPermission } from "./permission.ts";
+import { createServer } from "./server.ts";
 import { ask, closeSession } from "./session.ts";
 import { startSession } from "./start.ts";
 
-const server = new McpServer({ name: "hailr", version: "0.1.0" }, { capabilities: channelCapabilities });
+const server = createServer(() => ({
+  asker,
+  paneId: process.env.HERDR_PANE_ID,
+  now: Date.now,
+  newId: randomUUID,
+}));
 const socket = socketPath(process.env);
 const started = socket ? startSession(socket, (n) => server.server.notification(n)) : undefined;
 const asker = started && { clientId: started.clientId, ask: (q: Question) => ask(started.session, q) };
-const deps = () => ({ asker, paneId: process.env.HERDR_PANE_ID, now: Date.now, newId: randomUUID });
-
-// 形の崩れた通知は SDK が onerror に回すため、黙って消えないようにログに出す
-server.server.onerror = (e) => console.error(`hailr: ${String(e)}`);
-server.server.setNotificationHandler(permissionRequest, ({ params }) => askPermission(params, deps()));
-
-server.registerTool("ask_human", { description, inputSchema: askInput }, async (input) => {
-  try {
-    const text = await askHuman(input, deps());
-    return { content: [{ type: "text", text }] };
-  } catch (e) {
-    const text = e instanceof Error ? e.message : String(e);
-    return { isError: true, content: [{ type: "text", text }] };
-  }
-});
 
 await server.connect(new StdioServerTransport());
 // SSE の接続が残ると、Claude Code が stdin を閉じてもプロセスが終わらないため切る
