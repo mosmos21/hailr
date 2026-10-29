@@ -157,11 +157,44 @@ fn enter() -> Event {
     press(KeyCode::Enter, KeyModifiers::NONE)
 }
 
-#[test]
-fn sends_a_typed_reply_without_acting_on_its_keys() {
-    let (broker, client, mut events, _guard) = connected();
+/// 返事の枠に `1qdf ok` を打って Enter で送った状態にする
+fn sent_typed_reply() -> (
+    Arc<Broker>,
+    mpsc::Receiver<ClientEvent>,
+    ClientGuard,
+    App,
+    Question,
+    ClientId,
+) {
+    let (broker, client, events, guard) = connected();
     let question = ask(client, &["Yes"]);
     broker.register(question.clone()).unwrap();
+    let mut app = loaded(&broker);
+    on_event(&mut app, &broker, &char('r'));
+    for key in &typed_keys() {
+        on_event(&mut app, &broker, key);
+    }
+    on_event(&mut app, &broker, &enter());
+    assert!(app.answered_with(question.id).is_some());
+    (broker, events, guard, app, question, client)
+}
+
+fn typed_keys() -> [Event; 7] {
+    [
+        char('1'),
+        char('q'),
+        char('d'),
+        char('f'),
+        press(KeyCode::Char('d'), KeyModifiers::CONTROL),
+        press(KeyCode::Enter, KeyModifiers::ALT),
+        Event::Paste(" ok\n".into()),
+    ]
+}
+
+#[test]
+fn keeps_a_blank_reply_open_on_enter() {
+    let (broker, client, mut events, _guard) = connected();
+    broker.register(ask(client, &["Yes"])).unwrap();
     let mut app = loaded(&broker);
 
     assert_eq!(on_event(&mut app, &broker, &char('r')), Step::Nothing);
@@ -174,23 +207,27 @@ fn sends_a_typed_reply_without_acting_on_its_keys() {
     );
     assert_eq!(app.notice(), None);
     assert!(events.try_recv().is_err());
-    app.take_reply();
+}
+
+#[test]
+fn types_keys_into_a_reply_without_acting_on_them() {
+    let (broker, client, mut events, _guard) = connected();
+    broker.register(ask(client, &["Yes"])).unwrap();
+    let mut app = loaded(&broker);
+
     on_event(&mut app, &broker, &char('r'));
-    let keys = [
-        char('1'),
-        char('q'),
-        char('d'),
-        char('f'),
-        press(KeyCode::Char('d'), KeyModifiers::CONTROL),
-        press(KeyCode::Enter, KeyModifiers::ALT),
-        Event::Paste(" ok\n".into()),
-    ];
-    for key in &keys {
+    for key in &typed_keys() {
         assert_eq!(on_event(&mut app, &broker, key), Step::Nothing);
     }
     assert!(events.try_recv().is_err(), "keys typed are not actions");
     assert_eq!(broker.snapshot().len(), 1);
-    on_event(&mut app, &broker, &enter());
+    assert_eq!(app.reply().map(|r| r.1), Some("1qdf ok "));
+}
+
+#[test]
+fn sends_the_typed_reply_on_enter() {
+    let (_broker, mut events, _guard, app, question, _client) = sent_typed_reply();
+
     let answered = ClientEvent::Answered {
         id: question.id,
         answer: "1qdf ok".into(),
@@ -201,9 +238,20 @@ fn sends_a_typed_reply_without_acting_on_its_keys() {
         app.answered_with(question.id),
         Some(&Choice::Reply("1qdf ok".into()))
     );
+}
+
+#[test]
+fn does_not_open_a_second_reply_while_the_sent_one_is_kept() {
+    let (broker, _events, _guard, mut app, _question, _client) = sent_typed_reply();
+
     assert_eq!(on_event(&mut app, &broker, &enter()), Step::Nothing);
     on_event(&mut app, &broker, &char('r'));
     assert_eq!(app.reply(), None, "no second reply while it is kept");
+}
+
+#[test]
+fn quits_on_ctrl_c_while_replying_to_a_question_asked_after_one_was_kept() {
+    let (broker, _events, _guard, mut app, _question, client) = sent_typed_reply();
 
     on_event(&mut app, &broker, &char('k'));
     wait_out(&mut app, &broker);
@@ -216,9 +264,52 @@ fn sends_a_typed_reply_without_acting_on_its_keys() {
     assert_eq!(on_event(&mut app, &broker, &quit), Step::Quit);
 }
 
+fn ignored_keys() -> [Event; 2] {
+    [
+        press(KeyCode::Down, KeyModifiers::NONE),
+        press(KeyCode::Char('q'), KeyModifiers::ALT),
+    ]
+}
+
+/// 1 件目への返事の枠に `x` を打った状態にする（2 件目も並んでいる）
+fn typing_on_first() -> (
+    Arc<Broker>,
+    mpsc::Receiver<ClientEvent>,
+    ClientGuard,
+    App,
+    Question,
+    Question,
+) {
+    let (broker, client, events, guard) = connected();
+    let first = ask(client, &["Yes"]);
+    let mut second = ask(client, &["Yes"]);
+    second.asked_at = 2;
+    let mut app = second_selected(&broker, &[first.clone(), second.clone()]);
+    apply(&mut app, &broker, Action::Previous);
+    on_event(&mut app, &broker, &char('r'));
+    on_event(&mut app, &broker, &char('x'));
+    (broker, events, guard, app, first, second)
+}
+
+/// 返事を打っている 1 件目が取り下げられ、一覧を読み直した状態にする
+fn first_withdrawn_while_typing() -> (
+    Arc<Broker>,
+    mpsc::Receiver<ClientEvent>,
+    ClientGuard,
+    App,
+    Question,
+    Question,
+) {
+    let (broker, mut events, guard, mut app, first, second) = typing_on_first();
+    broker.withdraw(&first.id, WithdrawReason::Deleted);
+    assert!(events.try_recv().is_ok());
+    app.set_questions(broker.snapshot());
+    (broker, events, guard, app, first, second)
+}
+
 #[test]
-fn keeps_the_keys_out_of_commands_after_the_question_goes_away() {
-    let (broker, client, mut events, _guard) = connected();
+fn ignores_command_keys_and_clears_the_notice_while_typing() {
+    let (broker, client, _events, _guard) = connected();
     let first = ask(client, &["Yes"]);
     let mut second = ask(client, &["Yes"]);
     second.asked_at = 2;
@@ -226,12 +317,8 @@ fn keeps_the_keys_out_of_commands_after_the_question_goes_away() {
     apply(&mut app, &broker, Action::Previous);
 
     on_event(&mut app, &broker, &char('r'));
-    let ignored = [
-        press(KeyCode::Down, KeyModifiers::NONE),
-        press(KeyCode::Char('q'), KeyModifiers::ALT),
-    ];
     app.set_notice("old");
-    for key in &ignored {
+    for key in &ignored_keys() {
         assert_eq!(on_event(&mut app, &broker, key), Step::Nothing);
     }
     assert_eq!(
@@ -241,19 +328,33 @@ fn keeps_the_keys_out_of_commands_after_the_question_goes_away() {
     );
     on_event(&mut app, &broker, &char('x'));
     assert_eq!(app.notice(), None, "a typed key clears the notice");
-    broker.withdraw(&first.id, WithdrawReason::Deleted);
-    assert!(events.try_recv().is_ok());
-    app.set_questions(broker.snapshot());
+}
+
+#[test]
+fn keeps_the_keys_out_of_commands_after_the_question_goes_away() {
+    let (broker, mut events, _guard, mut app, _first, second) = first_withdrawn_while_typing();
+
     assert!(app.reply_gone());
     for key in [char('j'), char('d'), char('1'), char('q'), char('f')]
         .iter()
-        .chain(&ignored)
+        .chain(&ignored_keys())
     {
         assert_eq!(on_event(&mut app, &broker, key), Step::Nothing);
     }
     assert_eq!(app.selected().map(|q| q.id), Some(second.id));
     assert!(events.try_recv().is_err(), "nothing answered");
     assert_eq!(broker.snapshot(), vec![second]);
+    assert_eq!(
+        app.reply().map(|r| r.1),
+        Some("x"),
+        "keys after it went away are not typed"
+    );
+}
+
+#[test]
+fn keeps_the_stopped_reply_until_esc_when_the_question_is_asked_again() {
+    let (broker, mut events, _guard, mut app, first, _second) = first_withdrawn_while_typing();
+
     broker.register(first.clone()).unwrap();
     app.set_questions(broker.snapshot());
     assert!(
@@ -550,12 +651,22 @@ fn focuses_the_selected_pane_even_just_after_answering() {
     assert_eq!(apply(&mut app, &broker, Action::Focus), moved, "moved");
 }
 
-#[test]
-fn withdraws_only_a_question_whose_pane_was_focused() {
+/// 権限の質問と、別の client の ask の質問を並べ、どちらも取り下げを受け取れる状態にする
+struct PermissionAndAsk {
+    broker: Arc<Broker>,
+    asked: mpsc::Receiver<ClientEvent>,
+    untouched: mpsc::Receiver<ClientEvent>,
+    question: Question,
+    rest: Question,
+    app: App,
+    _guards: [ClientGuard; 2],
+}
+
+fn permission_and_ask() -> PermissionAndAsk {
     let broker = Broker::new();
     let (asker, other) = (ClientId(Uuid::new_v4()), ClientId(Uuid::new_v4()));
-    let (mut asked, _guard) = broker.connect(asker);
-    let (mut untouched, _other_guard) = broker.connect(other);
+    let (asked, asker_guard) = broker.connect(asker);
+    let (untouched, other_guard) = broker.connect(other);
     let question = test_support::permission().client(asker);
     let mut rest = ask(other, &["Yes"]);
     rest.asked_at = 2;
@@ -563,6 +674,27 @@ fn withdraws_only_a_question_whose_pane_was_focused() {
     broker.register(rest.clone()).unwrap();
     let mut app = App::default();
     app.set_questions(broker.snapshot());
+    PermissionAndAsk {
+        broker,
+        asked,
+        untouched,
+        question,
+        rest,
+        app,
+        _guards: [asker_guard, other_guard],
+    }
+}
+
+#[test]
+fn keeps_a_question_when_its_pane_was_not_focused() {
+    let PermissionAndAsk {
+        broker,
+        asked: _asked,
+        untouched: _untouched,
+        mut app,
+        _guards,
+        ..
+    } = permission_and_ask();
 
     app.set_notice("not answered: later");
     after_focus(&mut app, &broker, Err("not focused on w1:p1: x".into()));
@@ -572,6 +704,22 @@ fn withdraws_only_a_question_whose_pane_was_focused() {
     app.clear_notice();
     after_focus(&mut app, &broker, Err("not focused on w1:p1: x".into()));
     assert_eq!(app.notice(), Some("not focused on w1:p1: x"));
+    assert!(!app.just_moved());
+}
+
+#[test]
+fn withdraws_only_a_question_whose_pane_was_focused() {
+    let PermissionAndAsk {
+        broker,
+        mut asked,
+        mut untouched,
+        question,
+        rest,
+        mut app,
+        _guards,
+    } = permission_and_ask();
+
+    app.set_notice("not focused on w1:p1: x");
     assert!(!app.just_moved());
     after_focus(&mut app, &broker, Ok(question.id));
     assert!(app.notice().is_some(), "a success leaves the notice");
@@ -612,9 +760,9 @@ fn with_links(client: ClientId, links: &[&str]) -> Question {
     question
 }
 
-#[test]
-fn opens_the_link_after_o_and_never_answers_with_that_digit() {
-    let (broker, client, mut events, _guard) = connected();
+/// 2 件のリンクと 3 つ目のボタン（No）がある質問を、リンクとボタンを出した状態にする
+fn with_links_shown() -> (Arc<Broker>, mpsc::Receiver<ClientEvent>, ClientGuard, App) {
+    let (broker, client, events, guard) = connected();
     let mut question = with_links(client, &["https://a.example/", "https://b.example/"]);
     if let QuestionBody::Ask { options, .. } = &mut question.body {
         options.push("No".into());
@@ -624,8 +772,17 @@ fn opens_the_link_after_o_and_never_answers_with_that_digit() {
     app.set_questions(broker.snapshot());
     app.set_shown_buttons(2);
     app.set_shown_links(2);
+    (broker, events, guard, app)
+}
 
-    let open = |url: &str| Some(Effect::Open(url.into()));
+fn open(url: &str) -> Option<Effect> {
+    Some(Effect::Open(url.into()))
+}
+
+#[test]
+fn opens_the_link_after_o_and_ignores_the_held_digit() {
+    let (broker, mut events, _guard, mut app) = with_links_shown();
+
     apply(&mut app, &broker, Action::Open);
     assert_eq!(
         apply(&mut app, &broker, Action::Answer(1)),
@@ -638,7 +795,12 @@ fn opens_the_link_after_o_and_never_answers_with_that_digit() {
         "held down"
     );
     assert!(events.try_recv().is_err(), "the held digit does not answer");
-    app.settle_move();
+}
+
+#[test]
+fn keeps_waiting_for_a_link_on_o_and_opens_the_one_pressed() {
+    let (broker, _events, _guard, mut app) = with_links_shown();
+
     apply(&mut app, &broker, Action::Open);
     assert_eq!(
         apply(&mut app, &broker, Action::Open),
@@ -649,6 +811,12 @@ fn opens_the_link_after_o_and_never_answers_with_that_digit() {
         apply(&mut app, &broker, Action::Answer(0)),
         open("https://a.example/")
     );
+}
+
+#[test]
+fn keeps_waiting_for_a_link_on_digits_that_open_nothing() {
+    let (broker, mut events, _guard, mut app) = with_links_shown();
+
     apply(&mut app, &broker, Action::Open);
     app.set_shown_links(1);
     assert_eq!(
@@ -664,29 +832,60 @@ fn opens_the_link_after_o_and_never_answers_with_that_digit() {
     );
     assert!(app.opening(), "digits keep waiting");
     assert!(events.try_recv().is_err(), "no digit answered");
+}
 
+#[test]
+fn ends_the_wait_for_a_link_on_another_key_and_does_nothing_else() {
+    let (broker, _events, _guard, mut app) = with_links_shown();
+
+    apply(&mut app, &broker, Action::Open);
     let selected = app.selected_index();
     apply(&mut app, &broker, Action::Next);
     assert!(!app.opening(), "another key ends the wait");
     assert_eq!(app.selected_index(), selected, "and does nothing else");
-    app.set_shown_links(2);
+}
+
+#[test]
+fn only_cancels_the_wait_for_a_link_on_enter() {
+    let (broker, _events, _guard, mut app) = with_links_shown();
+
     apply(&mut app, &broker, Action::Open);
     assert_eq!(on_event(&mut app, &broker, &enter()), Step::Nothing);
     assert!(!app.opening(), "Enter only cancels");
+}
+
+#[test]
+fn only_cancels_the_wait_for_a_link_on_d() {
+    let (broker, _events, _guard, mut app) = with_links_shown();
+
     apply(&mut app, &broker, Action::Open);
     assert_eq!(apply(&mut app, &broker, Action::Delete), None);
     assert_eq!(broker.snapshot().len(), 1, "d only cancels");
     assert!(!app.opening());
+}
+
+#[test]
+fn only_cancels_the_wait_for_a_link_on_f() {
+    let (broker, _events, _guard, mut app) = with_links_shown();
+
     apply(&mut app, &broker, Action::Open);
     assert_eq!(apply(&mut app, &broker, Action::Focus), None, "f cancels o");
     assert!(!app.opening());
+}
+
+#[test]
+fn does_not_wait_for_a_link_when_there_is_none_to_open() {
+    let (broker, _events, _guard, mut app) = with_links_shown();
 
     app.set_shown_links(0);
     apply(&mut app, &broker, Action::Open);
     assert!(!app.opening(), "nothing to open");
+}
 
-    app.settle_move();
-    app.set_shown_links(2);
+#[test]
+fn answers_with_the_digit_once_the_guard_after_opening_a_link_is_over() {
+    let (broker, mut events, _guard, mut app) = with_links_shown();
+
     apply(&mut app, &broker, Action::Open);
     assert_eq!(
         apply(&mut app, &broker, Action::Answer(1)),
