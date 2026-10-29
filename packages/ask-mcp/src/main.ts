@@ -4,18 +4,18 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 
 import { askHuman, askInput, description } from "./ask.ts";
-import { Broker } from "./broker.ts";
+import type { Question } from "./broker.ts";
 import { channelCapabilities, permissionRequest } from "./channel.ts";
 import { socketPath } from "./paths.ts";
 import { askPermission } from "./permission.ts";
-import { Session } from "./session.ts";
+import { ask, closeSession } from "./session.ts";
+import { startSession } from "./start.ts";
 
 const server = new McpServer({ name: "hailr", version: "0.1.0" }, { capabilities: channelCapabilities });
 const socket = socketPath(process.env);
-const session = socket
-  ? new Session(new Broker(socket, randomUUID()), (n) => server.server.notification(n))
-  : undefined;
-const deps = () => ({ session, paneId: process.env.HERDR_PANE_ID, now: Date.now, newId: randomUUID });
+const started = socket ? startSession(socket, (n) => server.server.notification(n)) : undefined;
+const asker = started && { clientId: started.clientId, ask: (q: Question) => ask(started.session, q) };
+const deps = () => ({ asker, paneId: process.env.HERDR_PANE_ID, now: Date.now, newId: randomUUID });
 
 // 形の崩れた通知は SDK が onerror に回すため、黙って消えないようにログに出す
 server.server.onerror = (e) => console.error(`hailr: ${String(e)}`);
@@ -34,6 +34,6 @@ server.registerTool("ask_human", { description, inputSchema: askInput }, async (
 await server.connect(new StdioServerTransport());
 // SSE の接続が残ると、Claude Code が stdin を閉じてもプロセスが終わらないため切る
 process.stdin.once("end", () => {
-  session?.close();
+  if (started) closeSession(started.session);
   void server.close();
 });

@@ -1,8 +1,7 @@
 import * as z from "zod";
 
-import { BrokerUnavailable, Rejected } from "./broker.ts";
+import { BrokerUnavailable, type Question, Rejected } from "./broker.ts";
 import { inHerdrPane } from "./paths.ts";
-import type { Session } from "./session.ts";
 
 const text = z.string().refine((s) => s.trim() !== "", "must not be empty");
 
@@ -25,8 +24,11 @@ export const askInput = {
 
 export type AskInput = z.infer<z.ZodObject<typeof askInput>>;
 
+/** 質問を登録する先 */
+export type Asker = { clientId: string; ask: (question: Question) => Promise<void> };
+
 export type AskDeps = {
-  session: Pick<Session, "ask" | "clientId"> | undefined;
+  asker: Asker | undefined;
   paneId: string | undefined;
   now: () => number;
   newId: () => string;
@@ -39,19 +41,19 @@ export const description = [
 ].join(" ");
 
 /** 登録できたら Claude に返す文、できなければ理由を投げる */
-export async function askHuman(input: AskInput, deps: AskDeps): Promise<string> {
-  const { session, paneId } = deps;
+export const askHuman = async (input: AskInput, deps: AskDeps): Promise<string> => {
+  const { asker, paneId } = deps;
   if (!inHerdrPane(paneId)) {
     throw new Error("ask_human works only inside a herdr pane; ask in the pane instead");
   }
-  if (!session) {
+  if (!asker) {
     throw new Error("cannot find the hailr socket (HOME is not set); ask in the pane instead");
   }
   const id = deps.newId();
   try {
-    await session.ask({
+    await asker.ask({
       id,
-      clientId: session.clientId,
+      clientId: asker.clientId,
       paneId,
       askedAt: deps.now(),
       body: {
@@ -73,4 +75,4 @@ export async function askHuman(input: AskInput, deps: AskDeps): Promise<string> 
     throw e;
   }
   return `Asked (question ID ${id}). End your turn now; the answer will arrive as a channel message.`;
-}
+};
