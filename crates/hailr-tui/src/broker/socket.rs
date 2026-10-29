@@ -64,31 +64,14 @@ mod tests {
 
     use super::*;
 
-    struct TempDir(PathBuf);
-
-    impl TempDir {
-        fn new(name: &str) -> Self {
-            let dir =
-                std::env::temp_dir().join(format!("hailr-socket-{name}-{}", std::process::id()));
-            let _ = fs::remove_dir_all(&dir);
-            Self(dir)
-        }
-    }
-
-    impl Drop for TempDir {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.0);
-        }
-    }
-
     fn mode(path: &Path) -> u32 {
         fs::metadata(path).unwrap().permissions().mode() & 0o777
     }
 
     #[tokio::test]
     async fn creates_a_private_directory_and_removes_the_socket_on_drop() {
-        let tmp = TempDir::new("create");
-        let path = tmp.0.join("state/broker.sock");
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("state/broker.sock");
         let (_listener, file) = bind(&path).unwrap();
         assert_eq!(mode(path.parent().unwrap()), 0o700);
         assert!(path.exists());
@@ -98,17 +81,16 @@ mod tests {
 
     #[tokio::test]
     async fn tightens_an_existing_directory() {
-        let tmp = TempDir::new("tighten");
-        fs::create_dir_all(&tmp.0).unwrap();
-        fs::set_permissions(&tmp.0, Permissions::from_mode(0o755)).unwrap();
-        let (_listener, _file) = bind(&tmp.0.join("broker.sock")).unwrap();
-        assert_eq!(mode(&tmp.0), 0o700);
+        let tmp = tempfile::tempdir().unwrap();
+        fs::set_permissions(tmp.path(), Permissions::from_mode(0o755)).unwrap();
+        let (_listener, _file) = bind(&tmp.path().join("broker.sock")).unwrap();
+        assert_eq!(mode(tmp.path()), 0o700);
     }
 
     #[tokio::test]
     async fn replaces_a_leftover_socket() {
-        let tmp = TempDir::new("leftover");
-        let path = tmp.0.join("broker.sock");
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("broker.sock");
         let (listener, file) = bind(&path).unwrap();
         drop(listener);
         // 異常終了を真似て、ファイルだけを残す
@@ -118,19 +100,18 @@ mod tests {
 
     #[tokio::test]
     async fn the_socket_file_is_private() {
-        let tmp = TempDir::new("private");
-        let path = tmp.0.join("broker.sock");
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("broker.sock");
         let (_listener, _file) = bind(&path).unwrap();
         assert_eq!(mode(&path), 0o600);
     }
 
     #[tokio::test]
     async fn never_removes_something_that_is_not_a_socket() {
-        let tmp = TempDir::new("not-socket");
-        fs::create_dir_all(&tmp.0).unwrap();
-        let file = tmp.0.join("broker.sock");
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("broker.sock");
         fs::write(&file, "keep me").unwrap();
-        let link = tmp.0.join("link.sock");
+        let link = tmp.path().join("link.sock");
         std::os::unix::fs::symlink(&file, &link).unwrap();
 
         for path in [&file, &link] {
@@ -143,8 +124,8 @@ mod tests {
 
     #[tokio::test]
     async fn refuses_a_socket_that_is_in_use() {
-        let tmp = TempDir::new("in-use");
-        let path = tmp.0.join("broker.sock");
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("broker.sock");
         let (_listener, _file) = bind(&path).unwrap();
         let err = bind(&path).err().unwrap();
         assert_eq!(err.kind(), io::ErrorKind::AddrInUse);

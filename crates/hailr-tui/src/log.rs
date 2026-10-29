@@ -45,16 +45,10 @@ mod tests {
 
     use super::*;
 
-    fn temp_dir(name: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("hailr-log-{name}-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
-        dir
-    }
-
     #[test]
     fn keeps_one_previous_log_and_starts_a_private_file() {
-        let dir = temp_dir("rotate");
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
         let path = dir.join("hailr.log");
         for run in ["first", "second", "third"] {
             let mut file = open(&path).unwrap();
@@ -67,12 +61,12 @@ mod tests {
         );
         let mode = fs::metadata(&path).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600);
-        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
     fn never_writes_through_a_symlink() {
-        let dir = temp_dir("symlink");
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
         let target = dir.join("target");
         fs::write(&target, "keep").unwrap();
         let path = dir.join("hailr.log");
@@ -90,6 +84,5 @@ mod tests {
                 .file_type()
                 .is_symlink()
         );
-        fs::remove_dir_all(&dir).unwrap();
     }
 }
