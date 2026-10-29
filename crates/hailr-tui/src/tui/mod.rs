@@ -394,20 +394,32 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
+    use crate::broker::ClientGuard;
+    use crate::test_support::{self, QuestionExt};
 
     fn ask(client: ClientId, options: &[&str]) -> Question {
-        Question {
-            id: QuestionId(Uuid::new_v4()),
-            client_id: client,
-            pane_id: PaneId("w1:p1".into()),
-            asked_at: 1,
-            body: QuestionBody::Ask {
-                title: "t".into(),
-                question: "q".into(),
-                options: options.iter().map(|o| o.to_string()).collect(),
-                links: vec![],
-            },
-        }
+        test_support::ask().client(client).options(options)
+    }
+
+    /// 1 つの client が接続した broker にする
+    fn connected() -> (
+        Arc<Broker>,
+        ClientId,
+        mpsc::Receiver<ClientEvent>,
+        ClientGuard,
+    ) {
+        let broker = Broker::new();
+        let client = ClientId(Uuid::new_v4());
+        let (events, guard) = broker.connect(client);
+        (broker, client, events, guard)
+    }
+
+    /// broker の質問を読み込み、ボタンを全部出した状態にする
+    fn loaded(broker: &Broker) -> App {
+        let mut app = App::default();
+        app.set_questions(broker.snapshot());
+        app.set_shown_buttons(9);
+        app
     }
 
     /// 答えた質問を残す時間が過ぎたあとの一覧にする
@@ -420,18 +432,14 @@ mod tests {
         for q in questions {
             broker.register(q.clone()).unwrap();
         }
-        let mut app = App::default();
-        app.set_questions(broker.snapshot());
-        app.set_shown_buttons(9);
+        let mut app = loaded(broker);
         apply(&mut app, broker, Action::Next);
         app
     }
 
     #[test]
     fn keeps_an_answered_question_until_its_time_is_up() {
-        let broker = Broker::new();
-        let client = ClientId(Uuid::new_v4());
-        let (mut events, _guard) = broker.connect(client);
+        let (broker, client, mut events, _guard) = connected();
         let first = ask(client, &["Yes", "No"]);
         let mut second = ask(client, &["Yes"]);
         second.asked_at = 2;
@@ -477,14 +485,10 @@ mod tests {
 
     #[test]
     fn treats_a_question_asked_again_as_new() {
-        let broker = Broker::new();
-        let client = ClientId(Uuid::new_v4());
-        let (mut events, _guard) = broker.connect(client);
+        let (broker, client, mut events, _guard) = connected();
         let question = ask(client, &["Yes"]);
         broker.register(question.clone()).unwrap();
-        let mut app = App::default();
-        app.set_questions(broker.snapshot());
-        app.set_shown_buttons(9);
+        let mut app = loaded(&broker);
 
         apply(&mut app, &broker, Action::Answer(0));
         assert!(events.try_recv().is_ok());
@@ -502,9 +506,7 @@ mod tests {
 
     #[test]
     fn leaves_another_choice_alone_when_an_answered_question_comes_back() {
-        let broker = Broker::new();
-        let client = ClientId(Uuid::new_v4());
-        let (mut events, _guard) = broker.connect(client);
+        let (broker, client, mut events, _guard) = connected();
         let first = ask(client, &["Yes"]);
         let mut second = ask(client, &["Yes"]);
         second.asked_at = 2;
@@ -540,14 +542,10 @@ mod tests {
 
     #[test]
     fn sends_a_typed_reply_without_acting_on_its_keys() {
-        let broker = Broker::new();
-        let client = ClientId(Uuid::new_v4());
-        let (mut events, _guard) = broker.connect(client);
+        let (broker, client, mut events, _guard) = connected();
         let question = ask(client, &["Yes"]);
         broker.register(question.clone()).unwrap();
-        let mut app = App::default();
-        app.set_questions(broker.snapshot());
-        app.set_shown_buttons(9);
+        let mut app = loaded(&broker);
 
         assert_eq!(on_event(&mut app, &broker, &char('r')), Step::Nothing);
         on_event(&mut app, &broker, &Event::Paste("  ".into()));
@@ -603,9 +601,7 @@ mod tests {
 
     #[test]
     fn keeps_the_keys_out_of_commands_after_the_question_goes_away() {
-        let broker = Broker::new();
-        let client = ClientId(Uuid::new_v4());
-        let (mut events, _guard) = broker.connect(client);
+        let (broker, client, mut events, _guard) = connected();
         let first = ask(client, &["Yes"]);
         let mut second = ask(client, &["Yes"]);
         second.asked_at = 2;
@@ -657,9 +653,7 @@ mod tests {
 
     #[test]
     fn cancels_a_reply_and_tells_when_it_cannot_be_sent() {
-        let broker = Broker::new();
-        let client = ClientId(Uuid::new_v4());
-        let (events, _guard) = broker.connect(client);
+        let (broker, client, events, _guard) = connected();
         broker.register(ask(client, &["Yes"])).unwrap();
         let mut app = App::default();
         app.set_questions(broker.snapshot());
@@ -685,9 +679,7 @@ mod tests {
 
     #[test]
     fn keeps_nothing_when_the_delay_is_zero() {
-        let broker = Broker::new();
-        let client = ClientId(Uuid::new_v4());
-        let (_events, _guard) = broker.connect(client);
+        let (broker, client, _events, _guard) = connected();
         broker.register(ask(client, &["Yes"])).unwrap();
         let mut app = App::default();
         app.set_answered_for(Duration::ZERO);
@@ -707,9 +699,7 @@ mod tests {
 
     #[test]
     fn lets_another_question_be_answered_while_one_is_kept() {
-        let broker = Broker::new();
-        let client = ClientId(Uuid::new_v4());
-        let (mut events, _guard) = broker.connect(client);
+        let (broker, client, mut events, _guard) = connected();
         let mut questions: Vec<_> = (1..=3).map(|_| ask(client, &["Yes"])).collect();
         for (at, q) in (1..).zip(questions.iter_mut()) {
             q.asked_at = at;
@@ -752,9 +742,7 @@ mod tests {
 
     #[test]
     fn answers_the_selected_question_with_the_original_option() {
-        let broker = Broker::new();
-        let client = ClientId(Uuid::new_v4());
-        let (mut events, _guard) = broker.connect(client);
+        let (broker, client, mut events, _guard) = connected();
         let first = ask(client, &["Yes"]);
         let mut second = ask(client, &["Yes", "No\u{1b}[2J"]);
         second.asked_at = 2;
@@ -778,9 +766,7 @@ mod tests {
 
     #[test]
     fn deletes_the_selected_question() {
-        let broker = Broker::new();
-        let client = ClientId(Uuid::new_v4());
-        let (mut events, _guard) = broker.connect(client);
+        let (broker, client, mut events, _guard) = connected();
         let first = ask(client, &[]);
         let mut second = ask(client, &[]);
         second.asked_at = 2;
@@ -803,18 +789,14 @@ mod tests {
 
     #[test]
     fn keeps_ignoring_a_key_held_past_the_guard() {
-        let broker = Broker::new();
-        let client = ClientId(Uuid::new_v4());
-        let (mut events, _guard) = broker.connect(client);
+        let (broker, client, mut events, _guard) = connected();
         let first = ask(client, &["Yes"]);
         let mut next = ask(client, &["Allow"]);
         next.asked_at = 2;
         for q in [&first, &next] {
             broker.register(q.clone()).unwrap();
         }
-        let mut app = App::default();
-        app.set_questions(broker.snapshot());
-        app.set_shown_buttons(9);
+        let mut app = loaded(&broker);
 
         apply(&mut app, &broker, Action::Answer(0));
         assert!(events.try_recv().is_ok());
@@ -829,18 +811,14 @@ mod tests {
 
     #[test]
     fn ignores_held_keys_just_after_the_selection_moved() {
-        let broker = Broker::new();
-        let client = ClientId(Uuid::new_v4());
-        let (mut events, _guard) = broker.connect(client);
+        let (broker, client, mut events, _guard) = connected();
         let first = ask(client, &["Yes"]);
         let mut next = ask(client, &["Allow"]);
         next.asked_at = 2;
         for q in [&first, &next] {
             broker.register(q.clone()).unwrap();
         }
-        let mut app = App::default();
-        app.set_questions(broker.snapshot());
-        app.set_shown_buttons(9);
+        let mut app = loaded(&broker);
 
         apply(&mut app, &broker, Action::Answer(0));
         assert!(events.try_recv().is_ok());
@@ -871,13 +849,9 @@ mod tests {
 
     #[test]
     fn answers_at_once_a_question_that_arrives_after_the_guard() {
-        let broker = Broker::new();
-        let client = ClientId(Uuid::new_v4());
-        let (mut events, _guard) = broker.connect(client);
+        let (broker, client, mut events, _guard) = connected();
         broker.register(ask(client, &["Yes"])).unwrap();
-        let mut app = App::default();
-        app.set_questions(broker.snapshot());
-        app.set_shown_buttons(9);
+        let mut app = loaded(&broker);
 
         apply(&mut app, &broker, Action::Answer(0));
         assert!(events.try_recv().is_ok());
@@ -896,14 +870,10 @@ mod tests {
 
     #[test]
     fn answers_a_question_that_arrives_after_the_list_emptied() {
-        let broker = Broker::new();
-        let client = ClientId(Uuid::new_v4());
-        let (mut events, _guard) = broker.connect(client);
+        let (broker, client, mut events, _guard) = connected();
         let first = ask(client, &["Yes"]);
         broker.register(first).unwrap();
-        let mut app = App::default();
-        app.set_questions(broker.snapshot());
-        app.set_shown_buttons(9);
+        let mut app = loaded(&broker);
 
         apply(&mut app, &broker, Action::Answer(0));
         assert!(events.try_recv().is_ok());
@@ -931,14 +901,10 @@ mod tests {
 
     #[test]
     fn tells_when_the_answer_could_not_be_delivered_until_the_next_key() {
-        let broker = Broker::new();
-        let client = ClientId(Uuid::new_v4());
-        let (events, _guard) = broker.connect(client);
+        let (broker, client, events, _guard) = connected();
         drop(events);
         broker.register(ask(client, &["Yes"])).unwrap();
-        let mut app = App::default();
-        app.set_questions(broker.snapshot());
-        app.set_shown_buttons(9);
+        let mut app = loaded(&broker);
 
         apply(&mut app, &broker, Action::Answer(0));
         assert!(app.notice().unwrap().contains("ask again"));
@@ -949,9 +915,7 @@ mod tests {
 
     #[test]
     fn focuses_the_selected_pane_even_just_after_answering() {
-        let broker = Broker::new();
-        let client = ClientId(Uuid::new_v4());
-        let (_events, _guard) = broker.connect(client);
+        let (broker, client, _events, _guard) = connected();
         let mut app = App::default();
         assert_eq!(
             apply(&mut app, &broker, Action::Focus),
@@ -983,13 +947,7 @@ mod tests {
         let (asker, other) = (ClientId(Uuid::new_v4()), ClientId(Uuid::new_v4()));
         let (mut asked, _guard) = broker.connect(asker);
         let (mut untouched, _other_guard) = broker.connect(other);
-        let mut question = ask(asker, &[]);
-        question.body = QuestionBody::Permission {
-            request_id: "abcde".into(),
-            tool_name: "Bash".into(),
-            description: "d".into(),
-            input_preview: "p".into(),
-        };
+        let question = test_support::permission().client(asker);
         let mut rest = ask(other, &["Yes"]);
         rest.asked_at = 2;
         broker.register(question.clone()).unwrap();
@@ -1047,9 +1005,7 @@ mod tests {
 
     #[test]
     fn opens_the_link_after_o_and_never_answers_with_that_digit() {
-        let broker = Broker::new();
-        let client = ClientId(Uuid::new_v4());
-        let (mut events, _guard) = broker.connect(client);
+        let (broker, client, mut events, _guard) = connected();
         let mut question = with_links(client, &["https://a.example/", "https://b.example/"]);
         if let QuestionBody::Ask { options, .. } = &mut question.body {
             options.push("No".into());
@@ -1140,9 +1096,7 @@ mod tests {
 
     #[test]
     fn ends_the_wait_for_a_link_when_the_selection_moves() {
-        let broker = Broker::new();
-        let client = ClientId(Uuid::new_v4());
-        let (_events, _guard) = broker.connect(client);
+        let (broker, client, _events, _guard) = connected();
         let mut app = App::default();
         app.set_shown_links(1);
         apply(&mut app, &broker, Action::Open);
@@ -1200,9 +1154,7 @@ mod tests {
 
     #[test]
     fn answers_and_selects_by_click() {
-        let broker = Broker::new();
-        let client = ClientId(Uuid::new_v4());
-        let (mut events, _guard) = broker.connect(client);
+        let (broker, client, mut events, _guard) = connected();
         let first = with_links(client, &["https://a.example/"]);
         let mut next = with_links(client, &["https://b.example/"]);
         next.asked_at = 2;

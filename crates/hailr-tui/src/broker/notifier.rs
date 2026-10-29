@@ -56,42 +56,15 @@ fn plain(text: &str, max: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::Ordering;
     use std::time::Duration;
 
-    use hailr_core::mux::{MuxError, PaneInfo};
-    use hailr_core::protocol::{ClientId, PaneId, Question, WithdrawReason};
+    use hailr_core::protocol::{ClientId, Question, WithdrawReason};
     use tokio::sync::mpsc;
     use uuid::Uuid;
 
     use super::*;
-
-    /// notify に渡された値を送り出して失敗を返す。同時に走った数の最大も数える
-    struct FakeMux {
-        sent: mpsc::UnboundedSender<(String, String)>,
-        running: AtomicUsize,
-        most: AtomicUsize,
-    }
-
-    impl Mux for FakeMux {
-        fn list_panes(&self) -> Result<Vec<PaneInfo>, MuxError> {
-            unimplemented!()
-        }
-        fn read_pane(&self, _: &PaneId) -> Result<String, MuxError> {
-            unimplemented!()
-        }
-        fn focus(&self, _: &PaneId) -> Result<(), MuxError> {
-            unimplemented!()
-        }
-        fn notify(&self, title: &str, body: &str) -> Result<(), MuxError> {
-            let now = self.running.fetch_add(1, Ordering::SeqCst) + 1;
-            self.most.fetch_max(now, Ordering::SeqCst);
-            std::thread::sleep(Duration::from_millis(5));
-            self.running.fetch_sub(1, Ordering::SeqCst);
-            self.sent.send((title.into(), body.into())).unwrap();
-            Err(MuxError::InvalidPane)
-        }
-    }
+    use crate::test_support::{self, FakeMux, QuestionExt};
 
     struct Setup {
         broker: Arc<Broker>,
@@ -110,11 +83,7 @@ mod tests {
         let client = ClientId(Uuid::new_v4());
         let connection = broker.connect(client);
         let (tx, sent) = mpsc::unbounded_channel();
-        let mux = Arc::new(FakeMux {
-            sent: tx,
-            running: AtomicUsize::new(0),
-            most: AtomicUsize::new(0),
-        });
+        let mux = Arc::new(FakeMux::notifying(tx));
         Setup {
             broker,
             client,
@@ -130,18 +99,10 @@ mod tests {
     }
 
     fn ask(client: ClientId, question: &str) -> Question {
-        Question {
-            id: QuestionId(Uuid::new_v4()),
-            client_id: client,
-            pane_id: PaneId("w1:p1".into()),
-            asked_at: 1,
-            body: QuestionBody::Ask {
-                title: "Deploy?".into(),
-                question: question.into(),
-                options: vec![],
-                links: vec![],
-            },
-        }
+        test_support::ask()
+            .client(client)
+            .title("Deploy?")
+            .text(question)
     }
 
     async fn next(sent: &mut mpsc::UnboundedReceiver<(String, String)>) -> (String, String) {
@@ -162,15 +123,10 @@ mod tests {
         let settled = ask(s.client, "settled");
         s.broker.register(settled.clone()).unwrap();
         s.broker.withdraw(&settled.id, WithdrawReason::Deleted);
-        let permission = Question {
-            body: QuestionBody::Permission {
-                request_id: "abcde".into(),
-                tool_name: "Bash".into(),
-                description: "run\n\u{1b}]52;c;x\u{7}\u{202e}tests".into(),
-                input_preview: "pnpm test".into(),
-            },
-            ..ask(s.client, "")
-        };
+        let permission = test_support::permission()
+            .client(s.client)
+            .description("run\n\u{1b}]52;c;x\u{7}\u{202e}tests")
+            .input_preview("pnpm test");
         s.broker.register(permission).unwrap();
         let notifying = start(&s, arrivals);
 

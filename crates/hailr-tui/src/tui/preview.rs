@@ -65,12 +65,10 @@ fn to_text(ansi: &str) -> Text<'static> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Mutex;
-
-    use hailr_core::mux::{MuxError, PaneInfo};
     use ratatui::style::{Color, Style};
 
     use super::*;
+    use crate::test_support::FakeMux;
 
     #[test]
     fn keeps_colors_and_blanks_other_escapes() {
@@ -86,28 +84,6 @@ mod tests {
         assert_eq!(text.lines.len(), 2);
     }
 
-    /// 読んだ pane を返し、"bad" だけ失敗する偽の Mux
-    struct FakeMux(Mutex<Vec<String>>);
-
-    impl Mux for FakeMux {
-        fn list_panes(&self) -> Result<Vec<PaneInfo>, MuxError> {
-            unimplemented!()
-        }
-        fn read_pane(&self, pane: &PaneId) -> Result<String, MuxError> {
-            self.0.lock().unwrap().push(pane.0.clone());
-            if pane.0 == "bad" {
-                return Err(MuxError::InvalidPane);
-            }
-            Ok(format!("screen of {}", pane.0))
-        }
-        fn focus(&self, _: &PaneId) -> Result<(), MuxError> {
-            unimplemented!()
-        }
-        fn notify(&self, _: &str, _: &str) -> Result<(), MuxError> {
-            unimplemented!()
-        }
-    }
-
     /// 選び直してから tick より早く届くことを、tick の間隔より短い期限で確かめる
     async fn next(shots: &mut mpsc::Receiver<Shot>) -> Shot {
         tokio::time::timeout(INTERVAL / 2, shots.recv())
@@ -120,7 +96,7 @@ mod tests {
     async fn reads_the_selected_pane_right_away_and_reports_failures() {
         let (pane_tx, pane_rx) = watch::channel(None);
         let (shot_tx, mut shots) = mpsc::channel(4);
-        let mux = Arc::new(FakeMux(Mutex::default()));
+        let mux = Arc::new(FakeMux::default());
         let reading = tokio::spawn(run(mux.clone(), pane_rx, shot_tx));
         tokio::task::yield_now().await;
 
@@ -133,7 +109,7 @@ mod tests {
         assert_eq!(pane, PaneId("bad".into()));
         assert!(result.is_err());
         assert_eq!(
-            *mux.0.lock().unwrap(),
+            *mux.read.lock().unwrap(),
             ["a", "bad"],
             "nothing read while unselected"
         );

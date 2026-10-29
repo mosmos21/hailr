@@ -460,27 +460,16 @@ fn printable_lines(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use hailr_core::protocol::{ClientId, PaneId, QuestionId};
+    use hailr_core::protocol::PaneId;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use ratatui::text::Text;
-    use uuid::Uuid;
 
     use super::*;
+    use crate::test_support::{self, QuestionExt};
 
     fn ask(pane: &str, title: &str, question: &str) -> Question {
-        Question {
-            id: QuestionId(Uuid::new_v4()),
-            client_id: ClientId(Uuid::new_v4()),
-            pane_id: PaneId(pane.into()),
-            asked_at: 1,
-            body: QuestionBody::Ask {
-                title: title.into(),
-                question: question.into(),
-                options: vec![],
-                links: vec![],
-            },
-        }
+        test_support::ask().pane(pane).title(title).text(question)
     }
 
     fn render(app: &App, side: Side, width: u16, height: u16) -> Vec<String> {
@@ -580,13 +569,9 @@ mod tests {
     #[test]
     fn fits_word_wrapped_questions_and_keeps_permission_lines() {
         let mut app = App::default();
-        let mut permission = ask("w1:p1", "t", "q");
-        permission.body = QuestionBody::Permission {
-            request_id: "abcde".into(),
-            tool_name: "Bash".into(),
-            description: "Run the whole integration suite against staging databases".into(),
-            input_preview: "pnpm test\n--filter api".into(),
-        };
+        let permission = test_support::permission()
+            .description("Run the whole integration suite against staging databases")
+            .input_preview("pnpm test\n--filter api");
         app.set_questions(vec![permission]);
         let rows = render(&app, Side::Right, 60, 40);
         let text = rows.join("\n");
@@ -612,11 +597,7 @@ mod tests {
     }
 
     fn with_options(options: &[&str]) -> Question {
-        let mut q = ask("w1:p1", "Merge PR?", "Ship it?");
-        if let QuestionBody::Ask { options: o, .. } = &mut q.body {
-            *o = options.iter().map(|o| o.to_string()).collect();
-        }
-        q
+        ask("w1:p1", "Merge PR?", "Ship it?").options(options)
     }
 
     #[test]
@@ -831,13 +812,7 @@ mod tests {
             );
         }
 
-        let mut permission = with_options(&[]);
-        permission.body = QuestionBody::Permission {
-            request_id: "abcde".into(),
-            tool_name: "Bash".into(),
-            description: "d".into(),
-            input_preview: "p".into(),
-        };
+        let permission = test_support::permission();
         let mut app = App::default();
         app.set_questions(vec![permission]);
         let rows = render(&app, Side::Right, 80, 16);

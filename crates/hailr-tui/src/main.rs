@@ -3,6 +3,8 @@
 mod broker;
 mod config;
 mod log;
+#[cfg(test)]
+mod test_support;
 mod text;
 mod tui;
 
