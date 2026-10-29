@@ -1,11 +1,12 @@
 import { randomUUID } from "node:crypto";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import http from "node:http";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
 import { onTestFinished } from "vitest";
 
+import type { AskDeps } from "./ask.ts";
 import type { Question } from "./broker.ts";
 
 export const tempDir = () => {
@@ -64,12 +65,48 @@ export const fakeBroker = async (reply: () => Reply = () => [201, ""], headerDel
   return { socket, received, server, streams, sse };
 };
 
-export const question = (clientId: string): Question => {
-  return {
-    id: randomUUID(),
-    clientId,
-    paneId: "w1:p1",
-    askedAt: 1,
-    body: { kind: "ask", title: "t", question: "q", options: ["Yes"], links: [] },
+export const fixture = (name: string): unknown => {
+  const url = new URL(`../../../fixtures/protocol/${name}`, import.meta.url);
+  return JSON.parse(readFileSync(url, "utf8"));
+};
+
+export const question = ({
+  id = randomUUID(),
+  clientId = "c1",
+  title = "t",
+}: { id?: string; clientId?: string; title?: string } = {}): Question => ({
+  id,
+  clientId,
+  paneId: "w1:p1",
+  askedAt: 1,
+  body: { kind: "ask", title, question: "q", options: [], links: [] },
+});
+
+export const permission = ({ id, requestId }: { id: string; requestId: string }): Question => ({
+  ...question({ id }),
+  body: { kind: "permission", requestId, toolName: "Bash", description: "d", inputPreview: "p" },
+});
+
+/** expected と同じ id・client・pane・時刻で質問を組み立てさせ、ask に渡された質問を asked に残す */
+export const askDeps = ({
+  expected = question({ id: "q1" }),
+  ask = async () => {},
+}: {
+  expected?: Pick<Question, "id" | "clientId" | "paneId" | "askedAt">;
+  ask?: (q: Question) => Promise<void>;
+} = {}) => {
+  const asked: Question[] = [];
+  const value: AskDeps = {
+    asker: {
+      clientId: expected.clientId,
+      ask: async (q) => {
+        asked.push(q);
+        await ask(q);
+      },
+    },
+    paneId: expected.paneId,
+    now: () => expected.askedAt,
+    newId: () => expected.id,
   };
+  return { value, asked };
 };

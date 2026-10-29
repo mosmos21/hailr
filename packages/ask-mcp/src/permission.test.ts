@@ -1,36 +1,13 @@
-import { readFileSync } from "node:fs";
-
 import { expect, onTestFinished, test, vi } from "vitest";
 
-import type { AskDeps } from "./ask.ts";
 import { BrokerUnavailable, type Question } from "./broker.ts";
 import { askPermission } from "./permission.ts";
+import { askDeps, fixture } from "./testing.ts";
 
-const fixture = (): Question => {
-  const url = new URL("../../../fixtures/protocol/question-permission.json", import.meta.url);
-  return JSON.parse(readFileSync(url, "utf8")) as Question;
-};
-
-const deps = (ask: (q: Question) => Promise<void> = async () => {}) => {
-  const asked: Question[] = [];
-  const expected = fixture();
-  const value: AskDeps = {
-    asker: {
-      clientId: expected.clientId,
-      ask: async (q) => {
-        asked.push(q);
-        await ask(q);
-      },
-    },
-    paneId: expected.paneId,
-    now: () => expected.askedAt,
-    newId: () => expected.id,
-  };
-  return { value, asked, expected };
-};
+const expected = fixture("question-permission.json") as Question;
 
 test("asks a permission request the way the protocol fixture shows", async () => {
-  const { value, asked, expected } = deps();
+  const { value, asked } = askDeps({ expected });
   if (expected.body.kind !== "permission") throw new Error("fixture is not a permission");
   const { requestId, toolName, description, inputPreview } = expected.body;
   await askPermission(
@@ -44,8 +21,11 @@ test("leaves the request to the pane when hailr cannot take it", async () => {
   const log = vi.spyOn(console, "error").mockImplementation(() => {});
   onTestFinished(() => log.mockRestore());
   const request = { request_id: "abcde", tool_name: "Bash", description: "d", input_preview: "secret" };
-  const down = deps(async () => {
-    throw new BrokerUnavailable("ENOENT");
+  const down = askDeps({
+    expected,
+    ask: async () => {
+      throw new BrokerUnavailable("ENOENT");
+    },
   });
   await askPermission(request, down.value);
   for (const paneId of [undefined, "", "-x"]) {
