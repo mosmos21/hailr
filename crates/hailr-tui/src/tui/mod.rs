@@ -144,15 +144,20 @@ async fn run_loop(
             Some(shot) = shots.recv() => app.set_shot(shot),
             Some(result) = focused.recv() => after_focus(&mut app, broker, result),
         }
-        let repointed = pane_tx.send_if_modified(|pane| {
-            let selected = app.selected_pane();
-            let changed = *pane != selected;
-            *pane = selected;
-            changed
-        });
-        if repointed {
-            app.forget_shot();
-        }
+        repoint(&mut app, &pane_tx);
+    }
+}
+
+/// 選んでいる pane が変わったときだけ preview に知らせ、前の pane の画面を捨てる
+fn repoint(app: &mut App, pane_tx: &watch::Sender<Option<PaneId>>) {
+    let repointed = pane_tx.send_if_modified(|pane| {
+        let selected = app.selected_pane();
+        let changed = *pane != selected;
+        *pane = selected;
+        changed
+    });
+    if repointed {
+        app.forget_shot();
     }
 }
 
