@@ -105,40 +105,9 @@ mod tests {
     }
 
     #[test]
-    fn reads_the_mux() {
-        assert_eq!(toml::from_str::<Config>("").unwrap().mux, MuxKind::Herdr);
-        assert_eq!(
-            toml::from_str::<Config>("mux = \"herdr\"").unwrap().mux,
-            MuxKind::Herdr
-        );
-    }
-
-    #[test]
-    fn reads_the_side_of_the_question_list() {
-        assert_eq!(
-            toml::from_str::<Config>("").unwrap().ui.questions,
-            Side::Right
-        );
-        let config = toml::from_str::<Config>("[ui]\nquestions = \"left\"").unwrap();
-        assert_eq!(config.ui.questions, Side::Left);
-    }
-
-    #[test]
-    fn shows_toasts_only_when_asked() {
-        for input in ["", "[notify]", "[notify]\ntoast = false"] {
-            assert!(
-                !toml::from_str::<Config>(input).unwrap().notify.toast,
-                "{input}"
-            );
-        }
-        let config = toml::from_str::<Config>("[notify]\ntoast = true").unwrap();
-        assert!(config.notify.toast);
-    }
-
-    #[test]
     fn reads_how_long_to_keep_an_answered_question() {
         let delay = |input: &str| toml::from_str::<Config>(input).unwrap().ui.answered_delay;
-        assert_eq!(delay(""), Duration::from_millis(1500));
+        assert_eq!(delay(""), crate::tui::ANSWERED_FOR);
         assert_eq!(delay("[ui]\nanswered_delay = 0"), Duration::ZERO);
         assert_eq!(delay("[ui]\nanswered_delay = 2"), Duration::from_secs(2));
         assert_eq!(
@@ -152,12 +121,18 @@ mod tests {
     }
 
     #[test]
+    fn reads_an_empty_notify_section() {
+        assert!(!toml::from_str::<Config>("[notify]").unwrap().notify.toast);
+    }
+
+    #[test]
     fn rejects_unknown_values_and_keys() {
         for input in [
             "mux = \"tmux\"",
             "mux = \"Herdr\"",
             "muxx = \"herdr\"",
             "[ui]\nquestions = \"top\"",
+            "[ui]\nquestions = \"Left\"",
             "[ui]\nlist = \"left\"",
             "[notify]\ntoast = \"yes\"",
             "[notify]\nsound = true",

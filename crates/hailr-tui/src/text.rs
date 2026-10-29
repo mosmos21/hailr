@@ -52,6 +52,9 @@ mod tests {
 
     #[test]
     fn printable_blanks_controls() {
-        assert_eq!(printable("a\u{1b}]52;c;x\u{7}\u{202e}b"), "a ]52;c;x  b");
+        assert_eq!(
+            printable("a\u{1b}]52;c;x\u{7}\u{202e}b\u{9b}2J\u{7f}c"),
+            "a ]52;c;x  b 2J c"
+        );
     }
 }

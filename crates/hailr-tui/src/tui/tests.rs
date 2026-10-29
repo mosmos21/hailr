@@ -37,6 +37,13 @@ fn wait_out(app: &mut App, broker: &Broker) {
     app.expire_answered(Instant::now() + ANSWERED_FOR, broker.snapshot());
 }
 
+/// 選んでいる質問にボタン 0 で答え（送られたことを確かめ）、答えた質問を残す時間を過ぎさせる
+fn answer_and_wait_out(app: &mut App, broker: &Broker, events: &mut mpsc::Receiver<ClientEvent>) {
+    apply(app, broker, Action::Answer(0));
+    assert!(events.try_recv().is_ok());
+    wait_out(app, broker);
+}
+
 /// 質問を並べて登録し、2 件目を選んだ状態にする
 fn second_selected(broker: &Broker, questions: &[Question]) -> App {
     for q in questions {
@@ -408,9 +415,7 @@ fn keeps_ignoring_a_key_held_past_the_guard() {
     }
     let mut app = loaded(&broker);
 
-    apply(&mut app, &broker, Action::Answer(0));
-    assert!(events.try_recv().is_ok());
-    wait_out(&mut app, &broker);
+    answer_and_wait_out(&mut app, &broker, &mut events);
     app.age_move(MOVE_GUARD / 2 + Duration::from_millis(100));
     apply(&mut app, &broker, Action::Answer(0));
     app.age_move(MOVE_GUARD / 2 + Duration::from_millis(100));
@@ -430,9 +435,7 @@ fn ignores_held_keys_just_after_the_selection_moved() {
     }
     let mut app = loaded(&broker);
 
-    apply(&mut app, &broker, Action::Answer(0));
-    assert!(events.try_recv().is_ok());
-    wait_out(&mut app, &broker);
+    answer_and_wait_out(&mut app, &broker, &mut events);
     for action in [
         Action::Answer(0),
         Action::Answer(0),
@@ -463,9 +466,7 @@ fn answers_at_once_a_question_that_arrives_after_the_guard() {
     broker.register(ask(client, &["Yes"])).unwrap();
     let mut app = loaded(&broker);
 
-    apply(&mut app, &broker, Action::Answer(0));
-    assert!(events.try_recv().is_ok());
-    wait_out(&mut app, &broker);
+    answer_and_wait_out(&mut app, &broker, &mut events);
     app.settle_move();
     let next = ask(client, &["Allow"]);
     broker.register(next.clone()).unwrap();
@@ -485,9 +486,7 @@ fn answers_a_question_that_arrives_after_the_list_emptied() {
     broker.register(first).unwrap();
     let mut app = loaded(&broker);
 
-    apply(&mut app, &broker, Action::Answer(0));
-    assert!(events.try_recv().is_ok());
-    wait_out(&mut app, &broker);
+    answer_and_wait_out(&mut app, &broker, &mut events);
     app.age_move(MOVE_GUARD / 2 + Duration::from_millis(100));
     apply(&mut app, &broker, Action::Answer(0));
     app.age_move(MOVE_GUARD / 2 + Duration::from_millis(100));

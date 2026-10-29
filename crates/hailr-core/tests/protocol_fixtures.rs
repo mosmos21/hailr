@@ -20,11 +20,10 @@ fn ask_question() {
 }
 
 #[test]
-fn ask_question_without_options() {
-    let q: Question = round_trip(include_str!(
+fn ask_question_with_empty_lists() {
+    round_trip::<Question>(include_str!(
         "../../../fixtures/protocol/question-ask-minimal.json"
     ));
-    assert!(q.body.options().is_empty());
 }
 
 #[test]

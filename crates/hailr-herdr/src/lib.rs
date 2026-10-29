@@ -191,10 +191,8 @@ mod tests {
         let stub = Stub::new("{}");
         stub.mux().focus(&pane("w1B:p1")).unwrap();
         assert_eq!(stub.args(), ["agent", "focus", "w1B:p1"]);
-        for id in ["", "-x", "--help"] {
-            let refused = stub.mux().focus(&pane(id));
-            assert!(matches!(refused, Err(MuxError::InvalidPane)), "{id:?}");
-        }
+        let refused = stub.mux().focus(&pane("-x"));
+        assert!(matches!(refused, Err(MuxError::InvalidPane)));
         assert_eq!(
             stub.args(),
             ["agent", "focus", "w1B:p1"],

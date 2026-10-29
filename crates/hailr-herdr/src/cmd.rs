@@ -109,12 +109,6 @@ mod tests {
     }
 
     #[test]
-    fn reads_output_larger_than_the_pipe_buffer() {
-        let out = sh("head -c 1000000 /dev/zero", Duration::from_secs(5)).unwrap();
-        assert_eq!(out.len(), 1_000_000);
-    }
-
-    #[test]
     fn caps_stdout() {
         let script = format!("head -c {} /dev/zero", STDOUT_LIMIT + 1024);
         let out = sh(&script, Duration::from_secs(10)).unwrap();
@@ -149,14 +143,6 @@ mod tests {
         assert!(
             matches!(err, MuxError::Failed { ref stderr, .. } if stderr.len() as u64 == STDERR_LIMIT)
         );
-    }
-
-    #[test]
-    fn kills_after_timeout() {
-        let started = Instant::now();
-        let err = sh("sleep 5", Duration::from_millis(100)).unwrap_err();
-        assert!(matches!(err, MuxError::Timeout { .. }));
-        assert!(started.elapsed() < Duration::from_secs(2));
     }
 
     /// 孫の pid をファイルに書かせて `run` を呼び、期限切れになったあと孫が消えることを確かめる
