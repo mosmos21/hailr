@@ -1067,3 +1067,92 @@ fn refuses_an_option_removed_before_the_screen_caught_up() {
     assert_eq!(broker.snapshot(), vec![updated.clone()]);
     assert_eq!(app.selected(), Some(&updated));
 }
+
+/// 1 つ目の pane に 2 件、2 つ目の pane に 1 件の質問を並べ、1 件目を選んで画面を読んだ状態
+struct Previewing {
+    app: App,
+    first: Question,
+    same_pane: Question,
+    other_pane: Question,
+    pane_tx: watch::Sender<Option<PaneId>>,
+    pane_rx: watch::Receiver<Option<PaneId>>,
+}
+
+fn previewing_first() -> Previewing {
+    let client = ClientId(Uuid::new_v4());
+    let first = ask(client, &["Yes"]).pane("w1:p1");
+    let mut same_pane = ask(client, &["Yes"]).pane("w1:p1");
+    same_pane.asked_at = 2;
+    let mut other_pane = ask(client, &["Yes"]).pane("w2:p1");
+    other_pane.asked_at = 3;
+    let mut app = App::default();
+    app.set_questions(vec![first.clone(), same_pane.clone(), other_pane.clone()]);
+    let (pane_tx, pane_rx) = watch::channel(app.selected_pane());
+    assert!(!pane_rx.has_changed().unwrap());
+    app.set_shot((
+        first.pane_id.clone(),
+        Ok(ratatui::text::Text::raw("screen")),
+    ));
+    assert!(app.shot().is_some());
+    Previewing {
+        app,
+        first,
+        same_pane,
+        other_pane,
+        pane_tx,
+        pane_rx,
+    }
+}
+
+#[test]
+fn repoints_the_preview_and_forgets_the_shot_when_the_pane_changes() {
+    let Previewing {
+        mut app,
+        first,
+        other_pane,
+        pane_tx,
+        mut pane_rx,
+        ..
+    } = previewing_first();
+
+    app.select(other_pane.id);
+    repoint(&mut app, &pane_tx);
+    assert!(pane_rx.has_changed().unwrap());
+    assert_eq!(*pane_rx.borrow_and_update(), Some(other_pane.pane_id));
+    app.select(first.id);
+    assert!(app.shot().is_none(), "the old screen is not shown again");
+}
+
+#[test]
+fn keeps_the_preview_for_another_question_in_the_same_pane() {
+    let Previewing {
+        mut app,
+        same_pane,
+        pane_tx,
+        pane_rx,
+        ..
+    } = previewing_first();
+
+    app.select(same_pane.id);
+    repoint(&mut app, &pane_tx);
+    assert!(
+        !pane_rx.has_changed().unwrap(),
+        "the same pane is not read again"
+    );
+    assert!(app.shot().is_some());
+}
+
+#[test]
+fn stops_the_preview_when_no_question_is_left() {
+    let Previewing {
+        mut app,
+        pane_tx,
+        mut pane_rx,
+        ..
+    } = previewing_first();
+
+    app.set_questions(Vec::new());
+    repoint(&mut app, &pane_tx);
+    assert!(pane_rx.has_changed().unwrap());
+    assert_eq!(*pane_rx.borrow_and_update(), None);
+}
