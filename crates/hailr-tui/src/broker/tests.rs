@@ -333,24 +333,35 @@ fn announces_after_a_reconnect_only_if_the_notifier_missed_it() {
 fn reports_changes() {
     let broker = Broker::new();
     let changes = broker.changes();
+    let advanced = |before: &mut u64| {
+        let now = *changes.borrow();
+        let moved = now > *before;
+        *before = now;
+        moved
+    };
+    let mut seen = *changes.borrow();
     let c = client();
     let (_rx, guard) = broker.connect(c);
+    assert!(advanced(&mut seen), "connect");
     let q = ask(c, 1, &[]);
     broker.register(q.clone()).unwrap();
+    assert!(advanced(&mut seen), "register");
     let answered = ask(c, 2, &["Yes"]);
     broker.register(answered.clone()).unwrap();
+    assert!(advanced(&mut seen), "register another");
     broker.answer(&answered.id, "Yes".into()).unwrap();
+    assert!(advanced(&mut seen), "answer");
     broker.withdraw(&q.id, WithdrawReason::Deleted);
-    let before = *changes.borrow();
+    assert!(advanced(&mut seen), "withdraw");
+
     broker.withdraw(&q.id, WithdrawReason::Deleted);
     assert_eq!(
         broker.answer(&q.id, "Yes".into()),
         Err(AnswerError::NotFound)
     );
-    assert_eq!(*changes.borrow(), before, "no-ops must not notify");
+    assert!(!advanced(&mut seen), "no-ops must not notify");
     drop(guard);
-    // connect・登録 2 回・回答・取り下げ・切断
-    assert_eq!(*changes.borrow(), 6);
+    assert!(advanced(&mut seen), "disconnect");
 }
 
 #[test]
