@@ -345,24 +345,11 @@ impl App {
 
 #[cfg(test)]
 mod tests {
-    use hailr_core::protocol::{ClientId, QuestionBody};
-    use uuid::Uuid;
-
     use super::*;
+    use crate::test_support::{self, QuestionExt};
 
     fn question(pane: &str) -> Question {
-        Question {
-            id: QuestionId(Uuid::new_v4()),
-            client_id: ClientId(Uuid::new_v4()),
-            pane_id: PaneId(pane.into()),
-            asked_at: 1,
-            body: QuestionBody::Ask {
-                title: "t".into(),
-                question: "q".into(),
-                options: vec![],
-                links: vec![],
-            },
-        }
+        test_support::ask().pane(pane)
     }
 
     #[test]
@@ -484,13 +471,7 @@ mod tests {
     #[test]
     fn opens_no_reply_for_a_permission_request() {
         let mut app = App::default();
-        let mut q = question("w1:p1");
-        q.body = QuestionBody::Permission {
-            request_id: "abcde".into(),
-            tool_name: "Bash".into(),
-            description: "d".into(),
-            input_preview: "p".into(),
-        };
+        let q = test_support::permission();
         app.set_questions(vec![q]);
         app.start_reply();
         assert_eq!(app.reply(), None);

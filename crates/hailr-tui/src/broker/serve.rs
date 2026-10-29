@@ -49,7 +49,7 @@ mod tests {
     use std::path::PathBuf;
     use std::time::Instant;
 
-    use hailr_core::protocol::{ClientId, PaneId, Question, QuestionBody, QuestionId};
+    use hailr_core::protocol::{ClientId, Question};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::UnixStream;
     use tokio::sync::oneshot;
@@ -57,6 +57,7 @@ mod tests {
 
     use super::super::{RegisterError, socket};
     use super::*;
+    use crate::test_support::{self, QuestionExt};
 
     struct Server {
         dir: PathBuf,
@@ -112,18 +113,7 @@ mod tests {
     }
 
     fn question(client: ClientId) -> Question {
-        Question {
-            id: QuestionId(Uuid::new_v4()),
-            client_id: client,
-            pane_id: PaneId("w1:p1".into()),
-            asked_at: 1,
-            body: QuestionBody::Ask {
-                title: "t".into(),
-                question: "q".into(),
-                options: vec![],
-                links: vec![],
-            },
-        }
+        test_support::ask().client(client)
     }
 
     #[tokio::test]

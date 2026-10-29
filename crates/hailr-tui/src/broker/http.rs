@@ -56,26 +56,16 @@ async fn events(
 mod tests {
     use axum::body::Body;
     use axum::http::{Request, Response};
-    use hailr_core::protocol::{ClientEvent, PaneId, QuestionBody, QuestionId};
+    use hailr_core::protocol::{ClientEvent, PaneId};
     use http_body_util::BodyExt;
     use tower::ServiceExt;
     use uuid::Uuid;
 
     use super::*;
+    use crate::test_support::{self, QuestionExt};
 
     fn question(client: ClientId, options: &[&str]) -> Question {
-        Question {
-            id: QuestionId(Uuid::new_v4()),
-            client_id: client,
-            pane_id: PaneId("w1:p1".into()),
-            asked_at: 1,
-            body: QuestionBody::Ask {
-                title: "t".into(),
-                question: "q".into(),
-                options: options.iter().map(|o| o.to_string()).collect(),
-                links: vec![],
-            },
-        }
+        test_support::ask().client(client).options(options)
     }
 
     async fn post(broker: &Arc<Broker>, body: String) -> StatusCode {

@@ -2,35 +2,21 @@ use hailr_core::protocol::PaneId;
 use uuid::Uuid;
 
 use super::*;
+use crate::test_support::{self, QuestionExt};
 
 fn client() -> ClientId {
     ClientId(Uuid::new_v4())
 }
 
 fn ask(client: ClientId, asked_at: u64, options: &[&str]) -> Question {
-    Question {
-        id: QuestionId(Uuid::new_v4()),
-        client_id: client,
-        pane_id: PaneId("w1:p1".into()),
-        asked_at,
-        body: QuestionBody::Ask {
-            title: "t".into(),
-            question: "q".into(),
-            options: options.iter().map(|o| o.to_string()).collect(),
-            links: vec![],
-        },
-    }
+    test_support::ask()
+        .client(client)
+        .asked_at(asked_at)
+        .options(options)
 }
 
 fn permission(client: ClientId, asked_at: u64) -> Question {
-    let mut question = ask(client, asked_at, &[]);
-    question.body = QuestionBody::Permission {
-        request_id: "abcde".into(),
-        tool_name: "Bash".into(),
-        description: "d".into(),
-        input_preview: "p".into(),
-    };
-    question
+    test_support::permission().client(client).asked_at(asked_at)
 }
 
 #[test]
@@ -202,13 +188,7 @@ fn answers_permission_questions_with_allow_or_deny() {
     let broker = Broker::new();
     let c = client();
     let (mut rx, _guard) = broker.connect(c);
-    let mut q = ask(c, 1, &[]);
-    q.body = QuestionBody::Permission {
-        request_id: "abcde".into(),
-        tool_name: "Bash".into(),
-        description: "d".into(),
-        input_preview: "p".into(),
-    };
+    let q = permission(c, 1);
     broker.register(q.clone()).unwrap();
     assert_eq!(
         broker.answer(&q.id, "Yes".into()),
@@ -394,13 +374,7 @@ fn takes_a_typed_reply_for_questions_only() {
     assert_eq!(broker.snapshot(), vec![]);
     assert_eq!(broker.reply(&q.id, "x".into()), Err(AnswerError::NotFound));
 
-    let mut permission = ask(c, 2, &[]);
-    permission.body = QuestionBody::Permission {
-        request_id: "abcde".into(),
-        tool_name: "Bash".into(),
-        description: "d".into(),
-        input_preview: "p".into(),
-    };
+    let permission = permission(c, 2);
     broker.register(permission.clone()).unwrap();
     assert_eq!(
         broker.reply(&permission.id, "Allow".into()),
