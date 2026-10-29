@@ -6,16 +6,16 @@ import type { AskDeps } from "./ask.ts";
 import { BrokerUnavailable, type Question } from "./broker.ts";
 import { askPermission } from "./permission.ts";
 
-function fixture(): Question {
+const fixture = (): Question => {
   const url = new URL("../../../fixtures/protocol/question-permission.json", import.meta.url);
   return JSON.parse(readFileSync(url, "utf8")) as Question;
-}
+};
 
-function deps(ask: (q: Question) => Promise<void> = async () => {}) {
+const deps = (ask: (q: Question) => Promise<void> = async () => {}) => {
   const asked: Question[] = [];
   const expected = fixture();
   const value: AskDeps = {
-    session: {
+    asker: {
       clientId: expected.clientId,
       ask: async (q) => {
         asked.push(q);
@@ -27,7 +27,7 @@ function deps(ask: (q: Question) => Promise<void> = async () => {}) {
     newId: () => expected.id,
   };
   return { value, asked, expected };
-}
+};
 
 test("asks a permission request the way the protocol fixture shows", async () => {
   const { value, asked, expected } = deps();
@@ -51,7 +51,7 @@ test("leaves the request to the pane when hailr cannot take it", async () => {
   for (const paneId of [undefined, "", "-x"]) {
     await askPermission(request, { ...down.value, paneId });
   }
-  await askPermission(request, { ...down.value, session: undefined });
+  await askPermission(request, { ...down.value, asker: undefined });
   expect(down.asked).toHaveLength(1);
   expect(log).toHaveBeenCalledTimes(5);
   expect(log.mock.calls.flat().join(" ")).not.toContain("secret");

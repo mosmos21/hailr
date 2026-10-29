@@ -6,10 +6,10 @@ import * as z from "zod";
 import { type AskDeps, askHuman, askInput } from "./ask.ts";
 import { BrokerUnavailable, type Question, Rejected } from "./broker.ts";
 
-function deps(ask: (q: Question) => Promise<void> = async () => {}) {
+const deps = (ask: (q: Question) => Promise<void> = async () => {}) => {
   const asked: Question[] = [];
   const value: AskDeps = {
-    session: {
+    asker: {
       clientId: "c1",
       ask: async (q) => {
         asked.push(q);
@@ -21,12 +21,12 @@ function deps(ask: (q: Question) => Promise<void> = async () => {}) {
     newId: () => "q1",
   };
   return { value, asked };
-}
+};
 
-function fixture(name: string): Question {
+const fixture = (name: string): Question => {
   const url = new URL(`../../../fixtures/protocol/${name}`, import.meta.url);
   return JSON.parse(readFileSync(url, "utf8")) as Question;
-}
+};
 
 test.each(["question-ask.json", "question-ask-minimal.json"])(
   "sends what the protocol fixture %s shows",
@@ -43,7 +43,7 @@ test.each(["question-ask.json", "question-ask-minimal.json"])(
     };
     const text = await askHuman(input, {
       ...value,
-      session: value.session && { ...value.session, clientId: expected.clientId },
+      asker: value.asker && { ...value.asker, clientId: expected.clientId },
       paneId: expected.paneId,
       now: () => expected.askedAt,
       newId: () => expected.id,
@@ -58,7 +58,7 @@ test("explains why it cannot ask", async () => {
   for (const paneId of [undefined, "", "-x"]) {
     await expect(askHuman(input, { ...deps().value, paneId })).rejects.toThrow("herdr pane");
   }
-  await expect(askHuman(input, { ...deps().value, session: undefined })).rejects.toThrow("socket");
+  await expect(askHuman(input, { ...deps().value, asker: undefined })).rejects.toThrow("socket");
   const down = deps(async () => {
     throw new BrokerUnavailable("ENOENT");
   });

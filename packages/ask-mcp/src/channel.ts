@@ -7,16 +7,16 @@ export const channelCapabilities = {
 
 export type ChannelNotification = { method: string; params: Record<string, unknown> };
 
-export function channelNotification(content: string, meta: Record<string, string>) {
+export const channelNotification = (content: string, meta: Record<string, string>) => {
   return { method: "notifications/claude/channel", params: { content, meta } };
-}
+};
 
-export function permissionVerdict(requestId: string, behavior: "allow" | "deny") {
+export const permissionVerdict = (requestId: string, behavior: "allow" | "deny") => {
   return {
     method: "notifications/claude/channel/permission",
     params: { request_id: requestId, behavior },
   };
-}
+};
 
 export const permissionRequest = z.object({
   method: z.literal("notifications/claude/channel/permission_request"),

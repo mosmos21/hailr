@@ -1,115 +1,48 @@
 import { randomUUID } from "node:crypto";
-import { mkdtempSync, rmSync } from "node:fs";
-import http from "node:http";
-import { tmpdir } from "node:os";
 import path from "node:path";
 
-import { afterEach, expect, onTestFinished, test, vi } from "vitest";
+import { expect, onTestFinished, test, vi } from "vitest";
 
-import { Broker, BrokerUnavailable, type Question, Rejected } from "./broker.ts";
-
-const cleanups: (() => void)[] = [];
-afterEach(() => {
-  for (const cleanup of cleanups.splice(0)) {
-    cleanup();
-  }
-});
-
-function tempDir() {
-  const dir = mkdtempSync(path.join(tmpdir(), "hailr-"));
-  cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
-  return dir;
-}
-
-type Reply = [number, string] | "silent" | "cut";
-
-/** broker の代わりに、SSE をつないだ client の質問だけを受け付ける */
-async function fakeBroker(reply: () => Reply = () => [201, ""], headerDelayMs = 0) {
-  const sse = new Map<string, http.ServerResponse>();
-  const socket = path.join(tempDir(), "broker.sock");
-  const streams = new Map<string, number>();
-  const received: Question[] = [];
-  const server = http.createServer((request, response) => {
-    const events = request.url?.match(/^\/clients\/([^/]+)\/events$/);
-    if (request.method === "GET" && events?.[1]) {
-      const client = events[1];
-      streams.set(client, (streams.get(client) ?? 0) + 1);
-      const headers = setTimeout(() => {
-        response.writeHead(200, { "content-type": "text/event-stream" });
-        response.write(":\n\n");
-        sse.set(client, response);
-      }, headerDelayMs);
-      request.on("close", () => {
-        clearTimeout(headers);
-        streams.set(client, (streams.get(client) ?? 1) - 1);
-      });
-      return;
-    }
-    let body = "";
-    request.on("data", (chunk) => (body += chunk));
-    request.on("end", () => {
-      const question = JSON.parse(body) as Question;
-      if (!streams.get(question.clientId)) {
-        response.writeHead(409).end("no client");
-        return;
-      }
-      received.push(question);
-      const answer = reply();
-      if (answer === "cut") {
-        response.writeHead(201, { "content-length": "100" });
-        response.write("partial", () => response.socket?.destroy());
-      } else if (answer !== "silent") {
-        response.writeHead(answer[0]).end(answer[1]);
-      }
-    });
-  });
-  await new Promise<void>((resolve) => server.listen(socket, resolve));
-  cleanups.push(() => {
-    server.closeAllConnections();
-    server.close();
-  });
-  return { socket, received, server, streams, sse };
-}
-
-function question(clientId: string): Question {
-  return {
-    id: randomUUID(),
-    clientId,
-    paneId: "w1:p1",
-    askedAt: 1,
-    body: { kind: "ask", title: "t", question: "q", options: ["Yes"], links: [] },
-  };
-}
+import {
+  BrokerUnavailable,
+  type Question,
+  Rejected,
+  closeBroker,
+  connect,
+  createBroker,
+  register,
+} from "./broker.ts";
+import { type Reply, fakeBroker, question, tempDir } from "./testing.ts";
 
 test("shares one connection between calls and closes it", async () => {
   const fake = await fakeBroker();
   const client = randomUUID();
-  const broker = new Broker(fake.socket, client);
-  cleanups.push(() => broker.close());
+  const broker = createBroker(fake.socket, client);
+  onTestFinished(() => closeBroker(broker));
 
-  await Promise.all([broker.connect(), broker.connect()]);
-  await broker.connect();
+  await Promise.all([connect(broker), connect(broker)]);
+  await connect(broker);
   expect(fake.streams.get(client)).toBe(1);
   const first = question(client);
-  await broker.register(first);
+  await register(broker, first);
   expect(fake.received).toEqual([first]);
 
-  broker.close();
+  closeBroker(broker);
   await vi.waitFor(() => expect(fake.streams.get(client)).toBe(0));
 });
 
 test("connects again after the broker drops the connection", async () => {
   const fake = await fakeBroker();
   const client = randomUUID();
-  const broker = new Broker(fake.socket, client);
-  cleanups.push(() => broker.close());
-  await broker.connect();
+  const broker = createBroker(fake.socket, client);
+  onTestFinished(() => closeBroker(broker));
+  await connect(broker);
 
   fake.server.closeAllConnections();
   await vi.waitFor(() => expect(fake.streams.get(client)).toBe(0));
-  await expect(broker.register(question(client))).rejects.toBeInstanceOf(BrokerUnavailable);
-  await broker.connect();
-  await broker.register(question(client));
+  await expect(register(broker, question(client))).rejects.toBeInstanceOf(BrokerUnavailable);
+  await connect(broker);
+  await register(broker, question(client));
   expect(fake.received).toHaveLength(1);
 });
 
@@ -121,10 +54,10 @@ test.each<[Reply, (new (...args: never[]) => Error) | undefined, string]>([
 ])("reads the reply %j", async (reply, kind, message) => {
   const fake = await fakeBroker(() => reply);
   const client = randomUUID();
-  const broker = new Broker(fake.socket, client);
-  cleanups.push(() => broker.close());
-  await broker.connect();
-  const registered = broker.register(question(client));
+  const broker = createBroker(fake.socket, client);
+  onTestFinished(() => closeBroker(broker));
+  await connect(broker);
+  const registered = register(broker, question(client));
   if (!kind) {
     await expect(registered).resolves.toBeUndefined();
     return;
@@ -138,15 +71,14 @@ test.each<[Reply, (new (...args: never[]) => Error) | undefined, string]>([
 test("drops a connection the broker no longer knows", async () => {
   const fake = await fakeBroker(() => [409, "no client"]);
   const client = randomUUID();
-  const broker = new Broker(fake.socket, client);
-  cleanups.push(() => broker.close());
   let lost = 0;
-  broker.onLost = () => lost++;
-  await broker.connect();
-  await expect(broker.register(question(client))).rejects.toThrow("forgot this client");
+  const broker = createBroker(fake.socket, client, { onLost: () => lost++ });
+  onTestFinished(() => closeBroker(broker));
+  await connect(broker);
+  await expect(register(broker, question(client))).rejects.toThrow("forgot this client");
   await vi.waitFor(() => expect(fake.streams.get(client)).toBe(0));
   expect(lost).toBe(1);
-  await broker.connect();
+  await connect(broker);
   expect(fake.streams.get(client)).toBe(1);
 });
 
@@ -154,39 +86,38 @@ test("closes a connection that is still opening", async () => {
   // ヘッダーが届く前に切れることを見るため、テストの期限より長く待たせる
   const fake = await fakeBroker(undefined, 60_000);
   const client = randomUUID();
-  const broker = new Broker(fake.socket, client, 60_000);
-  const connecting = broker.connect();
+  const broker = createBroker(fake.socket, client, { timeoutMs: 60_000 });
+  const connecting = connect(broker);
   await vi.waitFor(() => expect(fake.streams.get(client)).toBe(1));
-  broker.close();
+  closeBroker(broker);
   await expect(connecting).rejects.toBeInstanceOf(BrokerUnavailable);
   await vi.waitFor(() => expect(fake.streams.get(client)).toBe(0));
-  await expect(broker.connect()).rejects.toThrow("closed");
+  await expect(connect(broker)).rejects.toThrow("closed");
 });
 
 test("gives up on a broker that is missing or silent", async () => {
-  const missing = new Broker(path.join(tempDir(), "missing.sock"), randomUUID());
-  await expect(missing.connect()).rejects.toBeInstanceOf(BrokerUnavailable);
+  const missing = createBroker(path.join(tempDir(), "missing.sock"), randomUUID());
+  await expect(connect(missing)).rejects.toBeInstanceOf(BrokerUnavailable);
 
   const fake = await fakeBroker(() => "silent");
   const client = randomUUID();
-  const broker = new Broker(fake.socket, client, 100);
-  cleanups.push(() => broker.close());
-  await broker.connect();
-  await expect(broker.register(question(client))).rejects.toBeInstanceOf(BrokerUnavailable);
+  const broker = createBroker(fake.socket, client, { timeoutMs: 100 });
+  onTestFinished(() => closeBroker(broker));
+  await connect(broker);
+  await expect(register(broker, question(client))).rejects.toBeInstanceOf(BrokerUnavailable);
 });
 
 test("reports a lost connection, but not a closed one", async () => {
   const fake = await fakeBroker();
   const client = randomUUID();
-  const broker = new Broker(fake.socket, client);
-  cleanups.push(() => broker.close());
   let lost = 0;
-  broker.onLost = () => lost++;
-  await broker.connect();
+  const broker = createBroker(fake.socket, client, { onLost: () => lost++ });
+  onTestFinished(() => closeBroker(broker));
+  await connect(broker);
   fake.server.closeAllConnections();
   await vi.waitFor(() => expect(lost).toBe(1));
-  await broker.connect();
-  broker.close();
+  await connect(broker);
+  closeBroker(broker);
   await vi.waitFor(() => expect(fake.streams.get(client)).toBe(0));
   expect(lost).toBe(1);
 });
@@ -194,11 +125,10 @@ test("reports a lost connection, but not a closed one", async () => {
 test("hands events to the listener", async () => {
   const fake = await fakeBroker();
   const client = randomUUID();
-  const broker = new Broker(fake.socket, client);
-  cleanups.push(() => broker.close());
   const events: unknown[] = [];
-  broker.onEvent = (event) => events.push(event);
-  await broker.connect();
+  const broker = createBroker(fake.socket, client, { onEvent: (event) => events.push(event) });
+  onTestFinished(() => closeBroker(broker));
+  await connect(broker);
 
   const stream = fake.sse.get(client);
   const yes = Buffer.from('data: {"type":"answered","id":"q1","answer":"はい"}\n\n');
@@ -221,11 +151,11 @@ test("hands events to the listener", async () => {
 test("drops a connection that sends an endless event", async () => {
   const fake = await fakeBroker();
   const client = randomUUID();
-  const broker = new Broker(fake.socket, client);
-  cleanups.push(() => broker.close());
+  const broker = createBroker(fake.socket, client);
+  onTestFinished(() => closeBroker(broker));
   const log = vi.spyOn(console, "error").mockImplementation(() => {});
   onTestFinished(() => log.mockRestore());
-  await broker.connect();
+  await connect(broker);
   fake.sse.get(client)?.write(`data: ${"x".repeat((1 << 20) + 1)}`);
   await vi.waitFor(() => expect(fake.streams.get(client)).toBe(0));
   expect(log).toHaveBeenCalledWith(expect.stringContaining("too long"));

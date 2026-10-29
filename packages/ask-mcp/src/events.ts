@@ -13,7 +13,7 @@ export const clientEvent = z.discriminatedUnion("type", [
 export type ClientEvent = z.infer<typeof clientEvent>;
 
 /** 区切りの空行までを 1 件として data 行を取り出す。読み切れていない残りも返す */
-export function readSse(buffer: string): { data: string[]; rest: string } {
+export const readSse = (buffer: string): { data: string[]; rest: string } => {
   const blocks = buffer.split(/\r?\n\r?\n/);
   const rest = blocks.pop() ?? "";
   const data = blocks.flatMap((block) => {
@@ -24,4 +24,4 @@ export function readSse(buffer: string): { data: string[]; rest: string } {
     return lines.length > 0 ? [lines.join("\n")] : [];
   });
   return { data, rest };
-}
+};
