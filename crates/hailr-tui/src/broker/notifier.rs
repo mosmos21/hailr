@@ -53,6 +53,7 @@ fn plain(text: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::Ordering;
+    use std::sync::mpsc as std_mpsc;
     use std::time::Duration;
 
     use hailr_core::protocol::{ClientId, Question, WithdrawReason};
@@ -67,6 +68,7 @@ mod tests {
         client: ClientId,
         mux: Arc<FakeMux>,
         sent: mpsc::UnboundedReceiver<(String, String)>,
+        release: std_mpsc::Sender<()>,
         _connection: (
             mpsc::Receiver<hailr_core::protocol::ClientEvent>,
             super::super::ClientGuard,
@@ -79,12 +81,14 @@ mod tests {
         let client = ClientId(Uuid::new_v4());
         let connection = broker.connect(client);
         let (tx, sent) = mpsc::unbounded_channel();
-        let mux = Arc::new(FakeMux::notifying(tx));
+        let (release, held) = std_mpsc::channel();
+        let mux = Arc::new(FakeMux::notifying(tx, held));
         Setup {
             broker,
             client,
             mux,
             sent,
+            release,
             _connection: connection,
         }
     }
@@ -101,11 +105,13 @@ mod tests {
             .text(question)
     }
 
-    async fn next(sent: &mut mpsc::UnboundedReceiver<(String, String)>) -> (String, String) {
-        tokio::time::timeout(Duration::from_secs(5), sent.recv())
+    async fn next(s: &mut Setup) -> (String, String) {
+        let notice = tokio::time::timeout(Duration::from_secs(5), s.sent.recv())
             .await
             .expect("notified in time")
-            .unwrap()
+            .unwrap();
+        s.release.send(()).unwrap();
+        notice
     }
 
     #[tokio::test]
@@ -126,12 +132,9 @@ mod tests {
         s.broker.register(permission).unwrap();
         let notifying = start(&s, arrivals);
 
+        assert_eq!(next(&mut s).await, ("Deploy?".into(), "new text".into()));
         assert_eq!(
-            next(&mut s.sent).await,
-            ("Deploy?".into(), "new text".into())
-        );
-        assert_eq!(
-            next(&mut s.sent).await,
+            next(&mut s).await,
             ("Allow Bash?".into(), "run  ]52;c;x  tests".into())
         );
         notifying.abort();
@@ -151,7 +154,7 @@ mod tests {
 
         let mut got = Vec::new();
         for _ in 1..texts.len() {
-            got.push(next(&mut s.sent).await.1);
+            got.push(next(&mut s).await.1);
         }
         assert_eq!(got, texts[1..]);
         assert_eq!(s.mux.most.load(Ordering::SeqCst), 1);
