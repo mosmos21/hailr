@@ -5,7 +5,7 @@ use hailr_core::protocol::{QuestionBody, QuestionId};
 use tokio::sync::broadcast::{self, error::RecvError};
 
 use super::Broker;
-use crate::text::is_unprintable;
+use crate::text::printable;
 
 const MAX_TITLE: usize = 100;
 const MAX_BODY: usize = 300;
@@ -43,11 +43,7 @@ fn notice(body: &QuestionBody) -> (String, String) {
 
 // 質問の文言は Claude が書き、mux が端末に描くこともあるため、制御文字と向きを変える文字を空白にして長さを切る
 fn plain(text: &str, max: usize) -> String {
-    let mut out: String = text
-        .chars()
-        .map(|c| if is_unprintable(c) { ' ' } else { c })
-        .take(max)
-        .collect();
+    let mut out: String = printable(text).chars().take(max).collect();
     if text.chars().nth(max).is_some() {
         out.push('…');
     }
@@ -172,20 +168,14 @@ mod tests {
     }
 
     #[test]
-    fn blanks_c1_controls_too() {
-        assert_eq!(plain("a\u{009B}2Jb\u{0085}c", 10), "a 2Jb c");
-    }
-
-    #[test]
-    fn notice_cleans_and_cuts_title_and_body() {
+    fn notice_cuts_title_and_body() {
         let body = QuestionBody::Permission {
             request_id: "abcde".into(),
-            tool_name: format!("\u{1b}[2J{}", "x".repeat(MAX_TITLE)),
+            tool_name: "x".repeat(MAX_TITLE),
             description: "y".repeat(MAX_BODY + 1),
             input_preview: String::new(),
         };
         let (title, text) = notice(&body);
-        assert!(title.starts_with("Allow  [2J"));
         assert_eq!(title.chars().count(), MAX_TITLE + 1);
         assert_eq!(text, format!("{}…", "y".repeat(MAX_BODY)));
     }

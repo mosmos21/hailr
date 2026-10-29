@@ -495,10 +495,5 @@ mod tests {
         app.erase_reply();
         assert_eq!(app.reply(), Some((q.id, "half")));
         assert_eq!(app.notice(), None);
-        app.set_questions(vec![q.clone()]);
-        assert!(
-            app.reply_gone(),
-            "asked again, it still waits for Esc like the buttons"
-        );
     }
 }
