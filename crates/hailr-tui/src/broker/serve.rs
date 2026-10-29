@@ -60,18 +60,17 @@ mod tests {
     use crate::test_support::{self, QuestionExt};
 
     struct Server {
-        dir: PathBuf,
         path: PathBuf,
         broker: Arc<Broker>,
         stop: Option<oneshot::Sender<()>>,
         task: tokio::task::JoinHandle<io::Result<()>>,
+        _dir: tempfile::TempDir,
     }
 
     impl Server {
-        async fn start(name: &str) -> Self {
-            let dir =
-                std::env::temp_dir().join(format!("hailr-serve-{name}-{}", std::process::id()));
-            let path = dir.join("b.sock");
+        async fn start() -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("b.sock");
             let (listener, file) = socket::bind(&path).unwrap();
             let broker = Broker::new();
             let (stop, stopped) = oneshot::channel::<()>();
@@ -79,7 +78,7 @@ mod tests {
                 let _ = stopped.await;
             }));
             Self {
-                dir,
+                _dir: dir,
                 path,
                 broker,
                 stop: Some(stop),
@@ -106,19 +105,13 @@ mod tests {
         }
     }
 
-    impl Drop for Server {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.dir);
-        }
-    }
-
     fn question(client: ClientId) -> Question {
         test_support::ask().client(client)
     }
 
     #[tokio::test]
     async fn notices_a_closed_sse_connection_quickly() {
-        let server = Server::start("disconnect").await;
+        let server = Server::start().await;
         let client = ClientId(Uuid::new_v4());
         let stream = server.subscribe(client).await;
         assert!(server.broker.register(question(client)).is_ok());
@@ -138,7 +131,7 @@ mod tests {
 
     #[tokio::test]
     async fn shuts_down_without_waiting_for_open_streams() {
-        let mut server = Server::start("shutdown").await;
+        let mut server = Server::start().await;
         let mut stream = server.subscribe(ClientId(Uuid::new_v4())).await;
 
         let started = Instant::now();

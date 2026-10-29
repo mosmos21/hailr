@@ -160,17 +160,19 @@ mod tests {
     }
 
     /// 孫の pid をファイルに書かせて `run` を呼び、期限切れになったあと孫が消えることを確かめる
-    fn assert_grandchild_killed(name: &str, script: impl Fn(&str) -> String, timeout: Duration) {
-        let pid_file =
-            std::env::temp_dir().join(format!("hailr-cmd-{name}-{}", std::process::id()));
+    fn assert_grandchild_killed(script: impl Fn(&str) -> String, timeout: Duration) {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("pid");
         let started = Instant::now();
         let err = sh(&script(&pid_file.display().to_string()), timeout).unwrap_err();
         assert!(matches!(err, MuxError::Timeout { .. }));
         assert!(started.elapsed() < Duration::from_secs(2));
 
-        let pid = std::fs::read_to_string(&pid_file);
-        let _ = std::fs::remove_file(&pid_file);
-        let pid: libc::pid_t = pid.unwrap().trim().parse().unwrap();
+        let pid: libc::pid_t = std::fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
         // 殺された孫は回収されるまで残るため、すぐには消えない
         let deadline = Instant::now() + Duration::from_secs(2);
         // SAFETY: シグナル 0 は存在の確認だけで、何も送らない
@@ -184,7 +186,6 @@ mod tests {
     fn kills_grandchildren_after_wait_timeout() {
         // 出力を閉じてから走り続けるので、読み取りは終わり、終了待ちの期限切れの経路を通る
         assert_grandchild_killed(
-            "wait",
             |f| format!("sleep 5 >&- 2>&- & echo $! > '{f}'; exec >&- 2>&-; sleep 5"),
             Duration::from_millis(300),
         );
@@ -193,7 +194,6 @@ mod tests {
     #[test]
     fn kills_grandchildren_after_read_timeout() {
         assert_grandchild_killed(
-            "read-wait",
             |f| format!("sleep 5 & echo $! > '{f}'; sleep 5"),
             Duration::from_millis(300),
         );
@@ -202,7 +202,6 @@ mod tests {
     #[test]
     fn gives_up_on_a_grandchild_holding_the_pipe() {
         assert_grandchild_killed(
-            "read",
             |f| format!("sleep 5 & echo $! > '{f}'"),
             Duration::from_millis(300),
         );

@@ -99,7 +99,8 @@ mod tests {
 
     #[test]
     fn missing_file_uses_defaults() {
-        let path = std::env::temp_dir().join(format!("hailr-no-config-{}", std::process::id()));
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config.toml");
         assert_eq!(Config::load(&path).unwrap(), Config::default());
     }
 

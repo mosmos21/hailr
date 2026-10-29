@@ -99,21 +99,19 @@ mod tests {
     use super::*;
 
     struct Stub {
-        dir: PathBuf,
+        dir: tempfile::TempDir,
     }
 
     impl Stub {
         /// 引数を 1 行ずつ `args` に書き、`stdout` を出力する偽の herdr
-        fn new(name: &str, stdout: &str) -> Self {
-            let dir =
-                std::env::temp_dir().join(format!("hailr-herdr-{name}-{}", std::process::id()));
-            fs::create_dir_all(&dir).unwrap();
-            fs::write(dir.join("stdout"), stdout).unwrap();
+        fn new(stdout: &str) -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            fs::write(dir.path().join("stdout"), stdout).unwrap();
             let script = format!(
                 "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{0}/args'\ncat '{0}/stdout'\n",
-                dir.display()
+                dir.path().display()
             );
-            let bin = dir.join("herdr");
+            let bin = dir.path().join("herdr");
             fs::write(&bin, script).unwrap();
             fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
             Self { dir }
@@ -124,21 +122,15 @@ mod tests {
         }
 
         fn bin(&self) -> PathBuf {
-            self.dir.join("herdr")
+            self.dir.path().join("herdr")
         }
 
         fn args(&self) -> Vec<String> {
-            fs::read_to_string(self.dir.join("args"))
+            fs::read_to_string(self.dir.path().join("args"))
                 .unwrap()
                 .lines()
                 .map(str::to_owned)
                 .collect()
-        }
-    }
-
-    impl Drop for Stub {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.dir);
         }
     }
 
@@ -148,14 +140,14 @@ mod tests {
 
     #[test]
     fn list_panes_calls_agent_list() {
-        let stub = Stub::new("list", r#"{"result":{"agents":[]}}"#);
+        let stub = Stub::new(r#"{"result":{"agents":[]}}"#);
         assert!(stub.mux().list_panes().unwrap().is_empty());
         assert_eq!(stub.args(), ["agent", "list"]);
     }
 
     #[test]
     fn read_pane_reads_the_visible_screen_with_ansi() {
-        let stub = Stub::new("read", "\x1b[1mhi\x1b[0m");
+        let stub = Stub::new("\x1b[1mhi\x1b[0m");
         assert_eq!(
             stub.mux().read_pane(&pane("w1B:p1")).unwrap(),
             "\x1b[1mhi\x1b[0m"
@@ -170,17 +162,17 @@ mod tests {
 
     #[test]
     fn read_pane_rejects_option_like_ids() {
-        let stub = Stub::new("reject", "");
+        let stub = Stub::new("");
         for id in ["", "-x", "--help"] {
             let err = stub.mux().read_pane(&pane(id)).unwrap_err();
             assert!(matches!(err, MuxError::InvalidPane));
         }
-        assert!(!stub.dir.join("args").exists());
+        assert!(!stub.dir.path().join("args").exists());
     }
 
     #[test]
     fn notify_keeps_dashes_from_becoming_options() {
-        let stub = Stub::new("notify", "");
+        let stub = Stub::new("");
         stub.mux().notify("--title", "-body - x").unwrap();
         assert_eq!(
             stub.args(),
@@ -196,7 +188,7 @@ mod tests {
 
     #[test]
     fn focuses_the_pane() {
-        let stub = Stub::new("focus", "{}");
+        let stub = Stub::new("{}");
         stub.mux().focus(&pane("w1B:p1")).unwrap();
         assert_eq!(stub.args(), ["agent", "focus", "w1B:p1"]);
         for id in ["", "-x", "--help"] {
@@ -212,8 +204,8 @@ mod tests {
 
     #[test]
     fn brings_the_herdr_window_forward_after_focusing() {
-        let herdr = Stub::new("raise-herdr", "{}");
-        let osascript = Stub::new("raise-osascript", "");
+        let herdr = Stub::new("{}");
+        let osascript = Stub::new("");
         let mux = HerdrMux {
             osascript: Some(osascript.bin()),
             ..herdr.mux()
@@ -224,7 +216,7 @@ mod tests {
         assert_eq!(osascript.args(), [vec!["-e".to_owned()], script].concat());
 
         let mux = HerdrMux {
-            osascript: Some(osascript.dir.join("missing")),
+            osascript: Some(osascript.dir.path().join("missing")),
             ..herdr.mux()
         };
         assert!(mux.focus(&pane("w1B:p1")).is_ok(), "focused even so");
@@ -233,12 +225,12 @@ mod tests {
 
     #[test]
     fn leaves_the_window_alone_when_focus_fails() {
-        let osascript = Stub::new("unfocused-osascript", "");
+        let osascript = Stub::new("");
         let mux = HerdrMux {
             osascript: Some(osascript.bin()),
-            ..HerdrMux::with_bin(osascript.dir.join("missing"))
+            ..HerdrMux::with_bin(osascript.dir.path().join("missing"))
         };
         assert!(mux.focus(&pane("w1B:p1")).is_err());
-        assert!(!osascript.dir.join("args").exists());
+        assert!(!osascript.dir.path().join("args").exists());
     }
 }
