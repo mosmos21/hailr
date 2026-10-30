@@ -117,4 +117,56 @@ mod tests {
         drop(pane_tx);
         reading.await.unwrap();
     }
+
+    #[tokio::test(start_paused = true)]
+    async fn rereads_the_selected_pane_every_interval() {
+        let (pane_tx, pane_rx) = watch::channel(None);
+        let (shot_tx, mut shots) = mpsc::channel(4);
+        let mux = Arc::new(FakeMux::default());
+        let reading = tokio::spawn(run(mux.clone(), pane_rx, shot_tx));
+        tokio::task::yield_now().await;
+
+        pane_tx.send(Some(PaneId("a".into()))).unwrap();
+        assert!(next(&mut shots).await.1.is_ok());
+        for _ in 0..2 {
+            tokio::time::advance(INTERVAL - Duration::from_millis(2)).await;
+            // 読みが走っている間は仮想時間が進まないため、窓の中に読みがあれば期限より先に届く
+            let early = tokio::time::timeout(Duration::from_millis(1), shots.recv()).await;
+            assert!(early.is_err(), "nothing read before the interval");
+            tokio::time::advance(Duration::from_millis(2)).await;
+            let (pane, result) = tokio::time::timeout(Duration::from_millis(1), shots.recv())
+                .await
+                .expect("read right at the interval")
+                .unwrap();
+            assert_eq!(pane, PaneId("a".into()));
+            assert!(result.is_ok());
+        }
+        assert_eq!(*mux.read.lock().unwrap(), ["a", "a", "a"]);
+
+        drop(pane_tx);
+        reading.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reports_a_panicking_read_and_keeps_reading() {
+        let (pane_tx, pane_rx) = watch::channel(None);
+        let (shot_tx, mut shots) = mpsc::channel(4);
+        let mux = Arc::new(FakeMux::default());
+        let reading = tokio::spawn(run(mux.clone(), pane_rx, shot_tx));
+        tokio::task::yield_now().await;
+
+        pane_tx.send(Some(PaneId("panic".into()))).unwrap();
+        let (pane, result) = next(&mut shots).await;
+        assert_eq!(pane, PaneId("panic".into()));
+        assert!(result.unwrap_err().starts_with("reading the pane panicked"));
+        tokio::time::advance(INTERVAL).await;
+        let (_, result) = next(&mut shots).await;
+        assert!(result.unwrap_err().starts_with("reading the pane panicked"));
+        pane_tx.send(Some(PaneId("a".into()))).unwrap();
+        let (_, result) = next(&mut shots).await;
+        assert_eq!(result.unwrap(), Text::raw("screen of a"));
+
+        drop(pane_tx);
+        reading.await.unwrap();
+    }
 }

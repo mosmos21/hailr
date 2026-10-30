@@ -143,6 +143,17 @@ mod tests {
     }
 
     #[test]
+    fn list_panes_reports_broken_json_as_a_parse_error() {
+        let stub = Stub::new("not json");
+        let err = stub.mux().list_panes().unwrap_err();
+        let expected = format!("{} agent list", stub.bin().display());
+        assert!(
+            matches!(err, MuxError::Parse { ref command, .. } if *command == expected),
+            "{err:?}"
+        );
+    }
+
+    #[test]
     fn read_pane_reads_the_visible_screen_with_ansi() {
         let stub = Stub::new("\x1b[1mhi\x1b[0m");
         assert_eq!(

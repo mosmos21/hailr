@@ -105,6 +105,23 @@ mod tests {
     }
 
     #[test]
+    fn broken_toml_is_a_parse_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config.toml");
+        fs::write(&path, "[ui\nquestions =").unwrap();
+        assert!(matches!(Config::load(&path), Err(ConfigError::Parse(_))));
+    }
+
+    #[test]
+    fn a_directory_is_a_read_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(matches!(
+            Config::load(tmp.path()),
+            Err(ConfigError::Read(_))
+        ));
+    }
+
+    #[test]
     fn reads_how_long_to_keep_an_answered_question() {
         let delay = |input: &str| toml::from_str::<Config>(input).unwrap().ui.answered_delay;
         assert_eq!(delay(""), crate::tui::ANSWERED_FOR);
