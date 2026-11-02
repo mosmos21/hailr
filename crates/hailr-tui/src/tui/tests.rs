@@ -961,6 +961,42 @@ fn opens_only_plain_web_links() {
 }
 
 #[test]
+fn tells_why_a_link_was_not_opened_without_opening_it() {
+    let mut app = App::default();
+    let mut opened = Vec::new();
+    open_checked(&mut app, "file:///etc/passwd", |url| {
+        opened.push(url.to_string());
+        Ok(())
+    });
+    assert!(opened.is_empty(), "{opened:?}");
+    assert_eq!(
+        app.notice(),
+        Some("not opened: only http and https links open")
+    );
+}
+
+#[test]
+fn opens_a_web_link_without_a_notice() {
+    let mut app = App::default();
+    let mut opened = Vec::new();
+    open_checked(&mut app, "https://a.example/x", |url| {
+        opened.push(url.to_string());
+        Ok(())
+    });
+    assert_eq!(opened, ["https://a.example/x"]);
+    assert_eq!(app.notice(), None);
+}
+
+#[test]
+fn tells_when_the_browser_could_not_be_started() {
+    let mut app = App::default();
+    open_checked(&mut app, "https://a.example/x", |_| {
+        Err(io::Error::other("no opener"))
+    });
+    assert_eq!(app.notice(), Some("not opened: no opener"));
+}
+
+#[test]
 fn answers_and_selects_by_click() {
     let (broker, client, mut events, _guard) = connected();
     let first = with_links(client, &["https://a.example/"]);
