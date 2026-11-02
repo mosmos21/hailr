@@ -117,11 +117,7 @@ async fn run_loop(
                 Some(Ok(event)) => match on_event(&mut app, broker, &event) {
                     Step::Quit => return Ok(()),
                     Step::Do(effect) => match effect {
-                        Effect::Open(link) => {
-                            if let Err(e) = checked_url(&link).and_then(|url| open_link(&url)) {
-                                app.set_notice(format!("not opened: {e}"));
-                            }
-                        }
+                        Effect::Open(link) => open_checked(&mut app, &link, open_link),
                         Effect::Focus(id, pane) => {
                             // herdr を待つ間も broker と描画を止めないよう、別のスレッドで呼んで結果だけ受け取る
                             let (mux, tx) = (Arc::clone(&mux), focus_tx.clone());
@@ -361,6 +357,13 @@ fn checked_url(link: &str) -> io::Result<url::Url> {
         return Err(invalid("links with a user name do not open"));
     }
     Ok(url)
+}
+
+/// 開けなかったら次のキーまで知らせる
+fn open_checked(app: &mut App, link: &str, open: impl FnOnce(&url::Url) -> io::Result<()>) {
+    if let Err(e) = checked_url(link).and_then(|url| open(&url)) {
+        app.set_notice(format!("not opened: {e}"));
+    }
 }
 
 /// tokio の runtime の中で呼ぶ
