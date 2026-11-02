@@ -94,7 +94,7 @@ fn displayable(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::os::unix::fs::PermissionsExt;
+    use std::path::Path;
 
     use super::*;
 
@@ -107,13 +107,10 @@ mod tests {
         fn new(stdout: &str) -> Self {
             let dir = tempfile::tempdir().unwrap();
             fs::write(dir.path().join("stdout"), stdout).unwrap();
-            let script = format!(
-                "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{0}/args'\ncat '{0}/stdout'\n",
-                dir.path().display()
-            );
-            let bin = dir.path().join("herdr");
-            fs::write(&bin, script).unwrap();
-            fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
+            // macOS は新しい実行ファイルを初回の exec で検査して並列だと期限を超えるため、1 本のスクリプトを symlink で指す
+            let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/testdata/herdr-stub");
+            assert!(script.is_file(), "{}", script.display());
+            std::os::unix::fs::symlink(script, dir.path().join("herdr")).unwrap();
             Self { dir }
         }
 
