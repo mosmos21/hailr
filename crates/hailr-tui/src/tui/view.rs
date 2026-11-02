@@ -2,8 +2,9 @@ use hailr_core::protocol::{Question, QuestionBody};
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::{Line, Span};
+use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, List, ListState, Paragraph, Wrap};
+use unicode_segmentation::UnicodeSegmentation;
 
 use super::app::{App, Choice, Target};
 use crate::config::Side;
@@ -112,8 +113,10 @@ fn draw_list(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_question(frame: &mut Frame, app: &App, question: &Question, area: Rect) {
-    let paragraph = Paragraph::new(body_text(&question.body)).wrap(Wrap { trim: false });
-    let wrapped = paragraph.line_count(area.width.saturating_sub(2));
+    let text_width = area.width.saturating_sub(2);
+    let paragraph =
+        Paragraph::new(body_text(&question.body, text_width)).wrap(Wrap { trim: false });
+    let wrapped = paragraph.line_count(text_width);
     let wrapped = u16::try_from(wrapped).unwrap_or(u16::MAX);
     let height = wrapped.saturating_add(2).min(area.height / 3).max(3);
     let answered = app.answered_with(question.id);
@@ -125,8 +128,8 @@ fn draw_question(frame: &mut Frame, app: &App, question: &Question, area: Rect) 
         Some(Choice::Reply(text)) => Some(text.as_str()),
         _ => None,
     };
-    let mut rows = button_rows(&question.body, area.width.saturating_sub(2), answered);
-    rows.extend(link_rows(&question.body, area.width.saturating_sub(2)));
+    let mut rows = button_rows(&question.body, text_width, answered);
+    rows.extend(link_rows(&question.body, text_width));
     let rows_height = match rows.len() {
         0 => 0,
         n => u16::try_from(n)
@@ -425,18 +428,124 @@ fn short_link(link: &str) -> Label {
     }
 }
 
-fn body_text(body: &QuestionBody) -> String {
+/// 入力が先に読めるよう、説明は後ろに控えめの色で置く
+fn body_text(body: &QuestionBody, width: u16) -> Text<'static> {
     match body {
-        QuestionBody::Ask { question, .. } => printable_lines(question),
+        QuestionBody::Ask { question, .. } => Text::raw(printable_lines(question)),
         QuestionBody::Permission {
             description,
             input_preview,
             ..
-        } => format!(
-            "{}\n\n{}",
-            printable_lines(description),
-            printable_lines(input_preview)
-        ),
+        } => {
+            let mut lines = if input_preview.is_empty() {
+                Vec::new()
+            } else {
+                input_lines(input_preview, usize::from(width))
+                    .unwrap_or_else(|| Text::raw(printable_lines(input_preview)).lines)
+            };
+            let summary = summary(description);
+            if !lines.is_empty() && !summary.is_empty() {
+                lines.push(Line::raw(""));
+            }
+            if !summary.is_empty() {
+                lines.push(Line::styled(summary, MUTED));
+            }
+            Text::from(lines)
+        }
+    }
+}
+
+/// 説明の最初の 1 文（最初の `. ` か改行まで）
+fn summary(description: &str) -> String {
+    let first = printable(description.trim_start().lines().next().unwrap_or(""));
+    let end = first.find(". ").map_or(first.len(), |i| i + 1);
+    first[..end].trim_end().to_owned()
+}
+
+/// 値の最低幅。キーの列がこれを残せないほど広いときはキーごとの行にしない
+const MIN_VALUE_WIDTH: usize = 8;
+
+/// JSON のオブジェクトの入力をキーごとの行にする。読めないとき、空のオブジェクト、キーが広すぎるときは None
+fn input_lines(input: &str, width: usize) -> Option<Vec<Line<'static>>> {
+    let Pairs(pairs) = serde_json::from_str(input).ok()?;
+    if pairs.is_empty() {
+        return None;
+    }
+    let pairs: Vec<(String, String)> = pairs
+        .iter()
+        .map(|(key, raw)| {
+            let value = match serde_json::from_str::<String>(raw.get()) {
+                Ok(text) => text,
+                Err(_) => raw.get().to_owned(),
+            };
+            (printable(key), value)
+        })
+        .collect();
+    let key_width = pairs.iter().map(|(key, _)| cells(key)).max().unwrap_or(0);
+    if key_width + 2 + MIN_VALUE_WIDTH > width {
+        return None;
+    }
+    let value_width = width - key_width - 2;
+    let mut lines = Vec::new();
+    for (key, value) in &pairs {
+        let pad = " ".repeat(key_width - cells(key));
+        let mut head = format!("{key}{pad}  ");
+        for line in value.split('\n') {
+            for chunk in wrap_graphemes(&printable(line), value_width) {
+                lines.push(Line::raw(format!("{head}{chunk}")));
+                head = " ".repeat(key_width + 2);
+            }
+        }
+    }
+    Some(lines)
+}
+
+/// ratatui は書記素ごとの幅でセルを置き、文字列の width() とずれることがあるため、書記素ごとに数える
+fn cells(text: &str) -> usize {
+    text.graphemes(true).map(|g| Span::raw(g).width()).sum()
+}
+
+/// 単語の途中でも幅いっぱいで折り返す。空の文字列も 1 行にする
+fn wrap_graphemes(text: &str, width: usize) -> Vec<&str> {
+    let mut rows = Vec::new();
+    let (mut start, mut used) = (0, 0);
+    for (i, grapheme) in text.grapheme_indices(true) {
+        let w = Span::raw(grapheme).width();
+        if used + w > width && used > 0 {
+            rows.push(&text[start..i]);
+            (start, used) = (i, 0);
+        }
+        used += w;
+    }
+    rows.push(&text[start..]);
+    rows
+}
+
+/// `serde_json::Map` はキーを並べ替えるため、入力の順のまま受け取る
+struct Pairs(Vec<(String, Box<serde_json::value::RawValue>)>);
+
+impl<'de> serde::Deserialize<'de> for Pairs {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Visitor;
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = Pairs;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a JSON object")
+            }
+
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Pairs, A::Error> {
+                let mut pairs = Vec::new();
+                while let Some(pair) = map.next_entry()? {
+                    pairs.push(pair);
+                }
+                Ok(Pairs(pairs))
+            }
+        }
+        deserializer.deserialize_map(Visitor)
     }
 }
 
