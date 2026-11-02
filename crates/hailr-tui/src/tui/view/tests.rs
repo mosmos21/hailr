@@ -729,3 +729,294 @@ fn clicks_the_rows_the_list_scrolled_to() {
     assert_eq!(app.target_at(x, 0), None, "the border");
     assert_eq!(app.target_at(x, 10), None, "the bottom border");
 }
+
+fn permission_rows(description: &str, input: &str, width: u16, height: u16) -> Vec<String> {
+    let mut app = App::default();
+    app.set_questions(vec![
+        test_support::permission()
+            .description(description)
+            .input_preview(input),
+    ]);
+    render(&app, Side::Right, width, height)
+}
+
+#[test]
+fn shows_a_json_input_by_key_before_the_first_sentence() {
+    let input = r#"{"spreadsheetId":"abc","range":"A1:B2","values":[["x",1]],"n":3}"#;
+    let rows = permission_rows("Sets values in a range. Needs write access.", input, 80, 30);
+    let text = rows.join("\n");
+    let line = |needle: &str| rows.iter().position(|r| r.contains(needle)).unwrap();
+    // キーは入力の順のまま最長に揃え、文字列は引用符を外し、ほかは詰めた JSON
+    assert!(
+        rows.iter().any(|r| r.contains("│spreadsheetId  abc")),
+        "{text}"
+    );
+    assert!(
+        rows.iter().any(|r| r.contains("│range          A1:B2")),
+        "{text}"
+    );
+    assert!(
+        rows.iter()
+            .any(|r| r.contains("│values         [[\"x\",1]]")),
+        "{text}"
+    );
+    assert!(
+        rows.iter().any(|r| r.contains("│n              3")),
+        "{text}"
+    );
+    assert!(line("spreadsheetId") < line("range") && line("range") < line("values"));
+    assert!(line("│n  ") < line("Sets values in a range."), "{text}");
+    assert!(!text.contains("Needs write access"), "{text}");
+    assert_eq!(rows[line("Sets values") - 1].trim_matches(['│', ' ']), "");
+}
+
+#[test]
+fn greys_the_description_only() {
+    let mut app = App::default();
+    app.set_questions(vec![
+        test_support::permission()
+            .description("Sets values.")
+            .input_preview(r#"{"a":"b"}"#),
+    ]);
+    let mut terminal = Terminal::new(TestBackend::new(60, 20)).unwrap();
+    terminal
+        .draw(|frame| draw(frame, &app, Side::Right))
+        .unwrap();
+    let buffer = terminal.backend().buffer();
+    let fg_of = |needle: &str| {
+        let (y, row) = (0..20)
+            .map(|y| {
+                (
+                    y,
+                    (0..60).map(|x| buffer[(x, y)].symbol()).collect::<String>(),
+                )
+            })
+            .find(|(_, row)| row.contains(needle))
+            .unwrap();
+        buffer[(u16::try_from(column(&row, needle)).unwrap(), y)].fg
+    };
+    assert_eq!(fg_of("Sets values."), MUTED);
+    assert_ne!(fg_of("a  b"), MUTED);
+}
+
+#[test]
+fn leaves_an_input_that_is_not_a_json_object_as_it_is() {
+    for input in ["pnpm test\n--filter api", "[1,2]", "{}", "{\"a\":"] {
+        let rows = permission_rows("Run it", input, 60, 20);
+        let text = rows.join("\n");
+        let first = input.lines().next().unwrap();
+        let at = rows.iter().position(|r| r.contains(first)).unwrap();
+        assert!(rows[at].contains(&format!("│{first}")), "{input:?}\n{text}");
+        assert!(
+            rows.iter().position(|r| r.contains("Run it")).unwrap() > at,
+            "{text}"
+        );
+    }
+}
+
+#[test]
+fn wraps_a_long_value_inside_the_value_column() {
+    let input = r#"{"range":"A1","values":"0123456789abcdefghijklmnopqrstuvwxyz"}"#;
+    // 内側の幅 28、キーの列 6 + 2 で値の列は 20
+    let rows = permission_rows("d", input, 54, 20);
+    let text = rows.join("\n");
+    assert!(
+        rows.iter()
+            .any(|r| r.contains("│values  0123456789abcdefghij")),
+        "{text}"
+    );
+    assert!(
+        rows.iter().any(|r| r.contains("│        klmnopqrstuvwxyz")),
+        "{text}"
+    );
+}
+
+#[test]
+fn keeps_the_input_visible_when_the_body_hits_its_cap() {
+    let description = "word ".repeat(300);
+    let rows = permission_rows(&description, r#"{"command":"ls"}"#, 80, 16);
+    let text = rows.join("\n");
+    assert!(rows.iter().any(|r| r.contains("│command  ls")), "{text}");
+}
+
+#[test]
+fn blanks_control_characters_in_keys_and_values() {
+    let input = r#"{"c":"a\u001b[2Jb\tc","k\u001b]0;x\u0007y":1}"#;
+    let rows = permission_rows("d", input, 60, 40);
+    let text = rows.join("\n");
+    assert!(
+        rows.iter().any(|r| r.contains("│c         a [2Jb c")),
+        "{text}"
+    );
+    assert!(rows.iter().any(|r| r.contains("│k ]0;x y  1")), "{text}");
+    assert!(
+        !rows.concat().chars().any(crate::text::is_unprintable),
+        "{text:?}"
+    );
+}
+
+#[test]
+fn aligns_and_wraps_double_width_characters() {
+    let input = r#"{"キー":"あいうえおかきくけこ","ab":"x"}"#;
+    // 内側の幅 18、キーの列 4 + 2 で値の列は 12（全角 6 文字）。全角は 2 セルで、2 つ目のセルは空白で描かれる
+    let rows = permission_rows("d", input, 44, 40);
+    let text = rows.join("\n");
+    assert!(
+        rows.iter()
+            .any(|r| r.contains("│キ ー   あ い う え お か")),
+        "{text}"
+    );
+    assert!(
+        rows.iter().any(|r| r.contains("│      き く け こ")),
+        "{text}"
+    );
+    assert!(rows.iter().any(|r| r.contains("│ab    x")), "{text}");
+}
+
+#[test]
+fn keeps_a_grapheme_cluster_in_one_piece() {
+    assert_eq!(wrap_graphemes("a❤\u{fe0f}b", 3), ["a❤\u{fe0f}", "b"]);
+    assert_eq!(wrap_graphemes("", 3), [""]);
+}
+
+#[test]
+fn takes_the_summary_up_to_a_newline_and_skips_leading_ones() {
+    assert_eq!(summary("First line\nSecond. Third."), "First line");
+    assert_eq!(summary("\n\nFirst. Second"), "First.");
+    assert_eq!(summary("One. Two"), "One.");
+    assert_eq!(summary("No stop"), "No stop");
+    assert_eq!(summary(""), "");
+}
+
+#[test]
+fn draws_a_json_permission_on_narrow_screens_without_panicking() {
+    let input = r#"{"spreadsheetId":"abc","values":[["x",1]],"キー":"あいうえお"}"#;
+    for (width, height) in [(1, 1), (3, 3), (10, 4), (20, 6), (30, 5), (40, 12)] {
+        permission_rows("Sets values. More.", input, width, height);
+    }
+}
+
+#[test]
+fn shows_nested_values_and_numbers_as_they_were_sent() {
+    let input = r#"{"o":{"z":1,"a":{"y":2,"b":3}},"n":1e2,"big":12345678901234567890123,"f":1.50,"t":true}"#;
+    let rows = permission_rows("d", input, 80, 40);
+    let text = rows.join("\n");
+    for expected in [
+        r#"│o    {"z":1,"a":{"y":2,"b":3}}"#,
+        "│n    1e2",
+        "│big  12345678901234567890123",
+        "│f    1.50",
+        "│t    true",
+    ] {
+        assert!(
+            rows.iter().any(|r| r.contains(expected)),
+            "{expected}\n{text}"
+        );
+    }
+}
+
+#[test]
+fn shows_the_input_as_it_is_when_the_keys_leave_no_room() {
+    let input = r#"{"averyveryverylongkeyname":"value"}"#;
+    // 内側の幅 28 では、キーの列 26 + 2 に値の最低幅が残らない
+    let rows = permission_rows("Run it", input, 54, 40);
+    let text = rows.join("\n");
+    assert!(
+        rows.iter()
+            .any(|r| r.contains("│{\"averyveryverylongkeyna")),
+        "{text}"
+    );
+    assert!(!text.contains("│averyvery"), "{text}");
+    let rows = permission_rows("Run it", input, 100, 40);
+    assert!(
+        rows.iter()
+            .any(|r| r.contains("│averyveryverylongkeyname  value")),
+        "{rows:?}"
+    );
+}
+
+#[test]
+fn splits_a_value_at_its_newlines() {
+    let input = r#"{"body":"one\ntwo\n\nthree","k":"v"}"#;
+    let rows = permission_rows("d", input, 60, 40);
+    let text = rows.join("\n");
+    let at = rows.iter().position(|r| r.contains("│body  one")).unwrap();
+    assert!(rows[at + 1].contains("│      two"), "{text}");
+    assert_eq!(rows[at + 2].trim_matches(['│', ' ']), "", "{text}");
+    assert!(rows[at + 3].contains("│      three"), "{text}");
+    assert!(rows[at + 4].contains("│k     v"), "{text}");
+}
+
+#[test]
+fn shows_a_pretty_printed_nested_value_as_it_was_sent() {
+    let input = "{\"o\": {\n  \"a\": 1\n}, \"k\": \"v\"}";
+    let rows = permission_rows("d", input, 60, 40);
+    let text = rows.join("\n");
+    let at = rows.iter().position(|r| r.contains("│o  {")).unwrap();
+    assert!(rows[at + 1].contains("│     \"a\": 1"), "{text}");
+    assert!(rows[at + 2].contains("│   }"), "{text}");
+    assert!(rows[at + 3].contains("│k  v"), "{text}");
+}
+
+#[test]
+fn needs_exactly_the_minimum_value_width_for_a_row_per_key() {
+    let input = r#"{"abcdefgh":"value"}"#;
+    // 内側の幅 18 は、キーの列 8 + 2 に値の列が 8 桁残る最小の幅
+    let rows = permission_rows("d", input, 44, 40);
+    assert!(
+        rows.iter().any(|r| r.contains("│abcdefgh  value")),
+        "{rows:?}"
+    );
+    let rows = permission_rows("d", input, 43, 40);
+    assert!(
+        rows.iter().any(|r| r.contains("│{\"abcdefgh\":\"valu")),
+        "{rows:?}"
+    );
+}
+
+#[test]
+fn aligns_keys_whose_graphemes_are_wider_than_the_string() {
+    // unicode-width は `لا` を幅 1 と数えるが、ratatui は書記素ごとに 1 セルずつ置くため、この入力でキーの揃い方を確かめる
+    assert!(Span::raw("لا").width() < cells("لا"));
+    let rows = permission_rows("d", r#"{"لا":"x","abc":"y"}"#, 60, 40);
+    assert!(rows.iter().any(|r| r.contains("│لا   x")), "{rows:?}");
+    assert!(rows.iter().any(|r| r.contains("│abc  y")), "{rows:?}");
+}
+
+#[test]
+fn falls_back_to_the_quoted_text_when_a_string_cannot_be_decoded() {
+    let rows = permission_rows("d", r#"{"s":"\ud800"}"#, 60, 40);
+    assert!(
+        rows.iter().any(|r| r.contains(r#"│s  "\ud800""#)),
+        "{rows:?}"
+    );
+}
+
+#[test]
+fn ends_the_body_right_after_its_last_line() {
+    let input = r#"{"body":"one\ntwo\n\nthree","k":"v"}"#;
+    let mut app = App::default();
+    app.set_questions(vec![
+        test_support::permission()
+            .description("d")
+            .input_preview(input),
+    ]);
+    let rows = render(&app, Side::Right, 60, 40);
+    let text = rows.join("\n");
+    let at = rows.iter().position(|r| r.contains("│d")).unwrap();
+    assert!(rows[at + 1].contains('└'), "{text}");
+    let top = rows.iter().position(|r| r.contains("┌Allow")).unwrap();
+    // 入力 5 行、空行、説明 1 行
+    assert_eq!(at - top, 7, "{text}");
+}
+
+#[test]
+fn adds_no_blank_line_when_the_description_or_the_input_is_empty() {
+    let rows = permission_rows("", r#"{"k":"v"}"#, 60, 40);
+    let at = rows.iter().position(|r| r.contains("│k  v")).unwrap();
+    assert!(rows[at + 1].contains('└'), "{rows:?}");
+    let rows = permission_rows("Run it", "", 60, 40);
+    let at = rows.iter().position(|r| r.contains("│Run it")).unwrap();
+    assert!(rows[at - 1].contains("┌Allow"), "{rows:?}");
+    assert!(rows[at + 1].contains('└'), "{rows:?}");
+}
