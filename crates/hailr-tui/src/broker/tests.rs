@@ -262,6 +262,29 @@ fn reconnecting_drops_the_previous_copies() {
 }
 
 #[test]
+fn answers_reach_the_new_connection_after_reconnecting() {
+    let broker = Broker::new();
+    let c = client();
+    let (mut old_rx, _old_guard) = broker.connect(c);
+    let (mut new_rx, _new_guard) = broker.connect(c);
+    let q = ask(c, 1, &["Yes"]);
+    broker.register(q.clone()).unwrap();
+
+    broker.answer(&q.id, "Yes".into()).unwrap();
+    assert_eq!(
+        new_rx.try_recv().unwrap(),
+        ClientEvent::Answered {
+            id: q.id,
+            answer: "Yes".into()
+        }
+    );
+    assert_eq!(
+        old_rx.try_recv(),
+        Err(mpsc::error::TryRecvError::Disconnected)
+    );
+}
+
+#[test]
 fn announces_a_question_once_even_across_reconnects() {
     let broker = Broker::new();
     let mut arrivals = broker.arrivals();

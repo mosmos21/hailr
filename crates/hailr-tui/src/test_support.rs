@@ -109,7 +109,7 @@ impl QuestionExt for Question {
     }
 }
 
-/// 偽の Mux。読んだ pane を覚えて "bad" だけ読みに失敗し、
+/// 偽の Mux。読んだ pane を覚えて、"bad" は読みに失敗し、"panic" は panic する。
 /// `notifying` で作ると notify の値を送り出し、解放されるまで止まってから失敗を返す。同時に走った数の最大も数える
 #[derive(Default)]
 pub struct FakeMux {
@@ -146,6 +146,9 @@ impl Mux for FakeMux {
 
     fn read_pane(&self, pane: &PaneId) -> Result<String, MuxError> {
         self.read.lock().unwrap().push(pane.0.clone());
+        if pane.0 == "panic" {
+            panic!("boom");
+        }
         if pane.0 == "bad" {
             return Err(MuxError::InvalidPane);
         }
